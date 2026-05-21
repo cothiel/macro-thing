@@ -1,5 +1,6 @@
 Work in Progress Macro Tool
 
+Run main.py to open tool
 Click Editor to open the editor panel and build macros. 
 Click Play to play your macro.
 
