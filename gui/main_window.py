@@ -29,7 +29,7 @@ class MainWindow(QMainWindow):
         self._bridge = _PlayerBridge()
 
         self._build_toolbar()
-        self._build_advanced_panel()
+        self._build_editor_panel()
         self._connect_signals()
 
         container = QWidget()
@@ -37,7 +37,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         main_layout.addWidget(self.toolbar_widget, 0)
-        main_layout.addWidget(self.advanced_panel, 1)
+        main_layout.addWidget(self.editor_panel, 1)
         self.setCentralWidget(container)
         self.setFixedSize(400, self.toolbar_widget.sizeHint().height())
 
@@ -87,13 +87,13 @@ class MainWindow(QMainWindow):
         toolbar_widget.setFixedHeight(40)
         self.toolbar_widget = toolbar_widget
 
-    def _build_advanced_panel(self):
+    def _build_editor_panel(self):
         self.actions_panel = ActionsPanel()
         self.macro_panel = MacroPanel()
         self.options_panel = OptionsPanel()
 
-        self.advanced_panel = QWidget()
-        layout = QHBoxLayout(self.advanced_panel)
+        self.editor_panel = QWidget()
+        layout = QHBoxLayout(self.editor_panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         line1 = QFrame()
@@ -107,7 +107,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.macro_panel)
         layout.addWidget(line2)
         layout.addWidget(self.options_panel)
-        self.advanced_panel.setVisible(False)
+        self.editor_panel.setVisible(False)
 
     def _connect_signals(self):
         self.editor_action.toggled.connect(self.on_editor_toggled)
@@ -120,10 +120,10 @@ class MainWindow(QMainWindow):
     
     def on_editor_toggled(self, checked: bool):
         if checked:
-            self.advanced_panel.setVisible(True)
+            self.editor_panel.setVisible(True)
             self.setFixedSize(550, 500)
         else:
-            self.advanced_panel.setVisible(False)
+            self.editor_panel.setVisible(False)
             self.setFixedSize(400, 40)
 
     def on_play_toggled(self, checked):
