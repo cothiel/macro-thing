@@ -6,6 +6,53 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 
+# --- key conversion ---
+
+_QT_KEY_TO_PYAUTOGUI = {
+    Qt.Key.Key_Return:       'enter',
+    Qt.Key.Key_Enter:        'enter',
+    Qt.Key.Key_Backspace:    'backspace',
+    Qt.Key.Key_Delete:       'delete',
+    Qt.Key.Key_Tab:          'tab',
+    Qt.Key.Key_Escape:       'escape',
+    Qt.Key.Key_Space:        'space',
+    Qt.Key.Key_Up:           'up',
+    Qt.Key.Key_Down:         'down',
+    Qt.Key.Key_Left:         'left',
+    Qt.Key.Key_Right:        'right',
+    Qt.Key.Key_Home:         'home',
+    Qt.Key.Key_End:          'end',
+    Qt.Key.Key_PageUp:       'pageup',
+    Qt.Key.Key_PageDown:     'pagedown',
+    Qt.Key.Key_Insert:       'insert',
+    Qt.Key.Key_CapsLock:     'capslock',
+    Qt.Key.Key_NumLock:      'numlock',
+    Qt.Key.Key_ScrollLock:   'scrolllock',
+    Qt.Key.Key_Pause:        'pause',
+    Qt.Key.Key_Print:        'printscreen',
+    Qt.Key.Key_Shift:        'shift',
+    Qt.Key.Key_Control:      'ctrl',
+    Qt.Key.Key_Alt:          'alt',
+    Qt.Key.Key_Meta:         'win',
+    Qt.Key.Key_F1:  'f1',  Qt.Key.Key_F2:  'f2',  Qt.Key.Key_F3:  'f3',
+    Qt.Key.Key_F4:  'f4',  Qt.Key.Key_F5:  'f5',  Qt.Key.Key_F6:  'f6',
+    Qt.Key.Key_F7:  'f7',  Qt.Key.Key_F8:  'f8',  Qt.Key.Key_F9:  'f9',
+    Qt.Key.Key_F10: 'f10', Qt.Key.Key_F11: 'f11', Qt.Key.Key_F12: 'f12',
+    Qt.Key.Key_F13: 'f13', Qt.Key.Key_F14: 'f14', Qt.Key.Key_F15: 'f15',
+    Qt.Key.Key_F16: 'f16', Qt.Key.Key_F17: 'f17', Qt.Key.Key_F18: 'f18',
+    Qt.Key.Key_F19: 'f19', Qt.Key.Key_F20: 'f20', Qt.Key.Key_F21: 'f21',
+    Qt.Key.Key_F22: 'f22', Qt.Key.Key_F23: 'f23', Qt.Key.Key_F24: 'f24',
+}
+
+def _qt_key_to_pyautogui(key: Qt.Key, text: str) -> str:
+    """Returns a pyautogui key name for the given Qt key, or '' if unsupported."""
+    if key in _QT_KEY_TO_PYAUTOGUI:
+        return _QT_KEY_TO_PYAUTOGUI[key]
+    if text and text.isprintable() and len(text) == 1:
+        return text.lower()
+    return ''
+
+
 # --- helpers ---
 
 def _coord_spin() -> QSpinBox:
@@ -324,16 +371,28 @@ class _PressKeyOptions(_BaseOptions):
         super().__init__(parent)
         form = QFormLayout(self)
         form.setContentsMargins(8, 8, 8, 8)
-        self._key = QLineEdit()
-        self._key.setPlaceholderText("e.g. enter, f5, a")
+        self._key = QPushButton("Click to select key")
+        self._key.setCheckable(True)
         form.addRow("Key:", self._key)
-        self._key.textChanged.connect(self._emit)
+        self._key.toggled.connect(self._on_key_toggled)
 
     def _populate(self, action):
         self._key.setText(action.key)
 
     def _apply(self, action):
         action.key = self._key.text()
+
+    def _on_key_toggled(self, checked):
+        if checked:
+            self._key.setText("Press a key")
+
+    def keyPressEvent(self, event):
+        if self._key.isChecked():
+            self._key.setText(_qt_key_to_pyautogui(event.key(), event.text()))
+            self._emit()
+            self._key.setChecked(False)
+    
+
 
 
 class _HotkeyOptions(_BaseOptions):
