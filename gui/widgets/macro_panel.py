@@ -5,109 +5,179 @@ import copy
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QFrame, QScrollArea
+    QWidget, QVBoxLayout, QLabel, QFrame, QListView, QAbstractItemView,
+    QStyledItemDelegate, QStyle,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QAbstractListModel, QModelIndex, QMimeData, QRect, QSize
+from PySide6.QtGui import QPainter, QColor, QPen, QPalette
 
-from gui.widgets.macro_item import MacroItem, get_dragged_item
+from gui.widgets.macro_item import get_dragged_item
+from gui.widgets.macro_model import MacroRow, group_actions, ungroup_rows
 
 
-class _DropZone(QWidget):
-    def __init__(self, on_item_click, parent=None):
+class MacroListModel(QAbstractListModel):
+    ActionRole = Qt.ItemDataRole.UserRole + 1  # returns the MacroRow
+
+    def __init__(self, rows=None, parent=None):
         super().__init__(parent)
-        self._on_item_click = on_item_click
-        self.setAcceptDrops(True)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(4, 4, 4, 4)
-        self._layout.setSpacing(4)
-        self._layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._rows = list(rows) if rows else []
 
-        self._indicator = QFrame(self)
-        self._indicator.setFixedHeight(3)
-        self._indicator.setStyleSheet("background-color: #0078d4;")
-        self._indicator.setVisible(False)
-        self._target_real_idx = -1
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self._rows)
 
-    def _connect_item(self, item: MacroItem):
-        item.item_selected.connect(self._on_item_click)
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return row.label()
+        if role == MacroListModel.ActionRole:
+            return row
+        return None
 
-    def _real_items(self):
-        result = []
-        for i in range(self._layout.count()):
-            item = self._layout.itemAt(i)
-            if item is None:
-                continue
-            w = item.widget()
-            if w is not None and w is not self._indicator:
-                result.append(w)
-        return result
+    def flags(self, index):
+        base = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        if index.isValid():
+            # Deliberately no ItemIsDropEnabled on real rows: if a row could
+            # accept an "on item" drop, hovering dead-center over it is
+            # ambiguous (insert before or after?) and Qt just no-ops. Without
+            # the flag, Qt's own drop-indicator logic falls back to whichever
+            # of above/below is closer to the cursor, which is what we want.
+            return base | Qt.ItemFlag.ItemIsDragEnabled
+        return base | Qt.ItemFlag.ItemIsDropEnabled  # empty-viewport area: allow append
 
-    def _update_indicator(self, pos):
-        dragged = get_dragged_item()
-        real_excl_dragged = [w for w in self._real_items() if w is not dragged]
+    def supportedDropActions(self):
+        return Qt.DropAction.MoveAction
 
-        target_real_idx = len(real_excl_dragged)
-        for i, w in enumerate(real_excl_dragged):
-            mid = w.geometry().top() + w.geometry().height() // 2
-            if pos.y() < mid:
-                target_real_idx = i
-                break
+    def mimeTypes(self):
+        return ["application/x-macro-row-index", "text/plain"]
 
-        if target_real_idx == self._target_real_idx:
-            return
+    def mimeData(self, indexes):
+        mime = QMimeData()
+        if indexes:
+            mime.setData("application/x-macro-row-index", str(indexes[0].row()).encode())
+            mime.setText("macro_item")
+        return mime
 
-        self._target_real_idx = target_real_idx
-        self._layout.removeWidget(self._indicator)
+    def dropMimeData(self, data, action, row, column, parent):
+        if row == -1:
+            row = self.rowCount()
 
-        if target_real_idx < len(real_excl_dragged):
-            insert_at = self._layout.indexOf(real_excl_dragged[target_real_idx])
+        if data.hasFormat("application/x-macro-row-index"):
+            # Qt-native internal reorder within this same view/model.
+            src = int(bytes(data.data("application/x-macro-row-index")).decode())
+            if src == row or src == row - 1:
+                return False
+            self.beginResetModel()
+            moved = self._rows.pop(src)
+            self._rows.insert(row - 1 if src < row else row, moved)
+            self.endResetModel()
+            return True
+
+        if data.hasText() and data.text() == "macro_item":
+            # Drag-in from ActionsPanel's existing template convention.
+            dragged = get_dragged_item()
+            if dragged is None or not dragged.is_template:
+                return False
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._rows.insert(row, MacroRow([copy.deepcopy(dragged.action)], configured=False))
+            self.endInsertRows()
+            return True
+
+        return False
+
+    # --- helpers used by MacroPanel, not part of QAbstractItemModel API ---
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self._rows = list(rows)
+        self.endResetModel()
+
+    def row_at(self, i):
+        return self._rows[i]
+
+    def row_index_of(self, row):
+        for i, r in enumerate(self._rows):
+            if r is row:
+                return i
+        return None
+
+    def remove_row(self, i):
+        self.beginRemoveRows(QModelIndex(), i, i)
+        del self._rows[i]
+        self.endRemoveRows()
+
+    def replace_row(self, i, new_row):
+        self._rows[i] = new_row
+        idx = self.index(i)
+        self.dataChanged.emit(idx, idx)
+
+    def replace_group_with_rows(self, i, new_rows):
+        self.beginRemoveRows(QModelIndex(), i, i)
+        del self._rows[i]
+        self.endRemoveRows()
+        if new_rows:
+            self.beginInsertRows(QModelIndex(), i, i + len(new_rows) - 1)
+            self._rows[i:i] = new_rows
+            self.endInsertRows()
+
+
+class MacroItemDelegate(QStyledItemDelegate):
+    """Paints each row as its own rounded card so rows read as distinct
+    items in the list rather than plain lines of text."""
+
+    _ROW_HEIGHT = 32
+    _RADIUS = 6
+
+    def paint(self, painter, option, index):
+        row = index.data(MacroListModel.ActionRole)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+
+        # Measured the ActionsPanel's actual rendered template cards directly
+        # (grabbed a screenshot and sampled pixels) rather than assume: they
+        # render as a filled rounded rect using the palette's Base role
+        # (#2d2d2d here), with no visible border stroke -- not Window and
+        # not Button as originally guessed. Match that exactly.
+        palette = option.palette
+        no_border = QPen(Qt.PenStyle.NoPen)
+        if selected:
+            bg = palette.color(QPalette.ColorRole.Highlight)
+            border_pen = no_border
+            text_color = palette.color(QPalette.ColorRole.HighlightedText)
+        elif hovered:
+            bg = palette.color(QPalette.ColorRole.Base).lighter(130)
+            border_pen = no_border
+            text_color = palette.color(QPalette.ColorRole.WindowText)
         else:
-            insert_at = self._layout.count()
+            bg = palette.color(QPalette.ColorRole.Base)
+            border_pen = no_border
+            text_color = palette.color(QPalette.ColorRole.WindowText)
 
-        self._layout.insertWidget(insert_at, self._indicator)
-        self._indicator.setVisible(True)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    def _hide_indicator(self):
-        self._layout.removeWidget(self._indicator)
-        self._indicator.setVisible(False)
-        self._target_real_idx = -1
+        rect = option.rect.adjusted(1, 1, -1, -1)
+        painter.setPen(border_pen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, self._RADIUS, self._RADIUS)
 
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasText() and event.mimeData().text() == "macro_item":
-            self._update_indicator(event.position().toPoint())
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+        painter.setPen(text_color)
+        text_rect = rect.adjusted(10, 0, -22, 0)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                          row.label() if row is not None else "")
 
-    def dragMoveEvent(self, event):
-        self._update_indicator(event.position().toPoint())
-        event.acceptProposedAction()
+        if row is not None and not row.is_configured():
+            d = 8
+            dot_rect = QRect(rect.right() - d - 8, rect.center().y() - d // 2, d, d)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#f5c400"))
+            painter.drawEllipse(dot_rect)
 
-    def dragLeaveEvent(self, event):
-        self._hide_indicator()
-        super().dragLeaveEvent(event)
+        painter.restore()
 
-    def dropEvent(self, event):
-        item = get_dragged_item()
-        if item is None:
-            self._hide_indicator()
-            event.ignore()
-            return
-
-        indicator_layout_idx = self._layout.indexOf(self._indicator)
-        self._hide_indicator()
-
-        if item.is_template:
-            new_item = MacroItem(copy.deepcopy(item.action))
-            self._connect_item(new_item)
-            self._layout.insertWidget(indicator_layout_idx, new_item)
-        else:
-            item_layout_idx = self._layout.indexOf(item)
-            self._layout.removeWidget(item)
-            final_idx = indicator_layout_idx - 1 if item_layout_idx < indicator_layout_idx else indicator_layout_idx
-            self._layout.insertWidget(final_idx, item)
-
-        event.acceptProposedAction()
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), self._ROW_HEIGHT)
 
 
 class MacroPanel(QWidget):
@@ -115,7 +185,6 @@ class MacroPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._selected_item = None
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 10, 0, 0)
@@ -128,50 +197,56 @@ class MacroPanel(QWidget):
         line.setFrameShape(QFrame.Shape.HLine)
         line.setFrameShadow(QFrame.Shadow.Sunken)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        self._drop_zone = _DropZone(on_item_click=self._on_item_clicked)
-        scroll.setWidget(self._drop_zone)
+        self._model = MacroListModel()
+        self._view = QListView()
+        self._view.setModel(self._model)
+        self._view.setDragEnabled(True)
+        self._view.setAcceptDrops(True)
+        self._view.setDropIndicatorShown(True)
+        self._view.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self._view.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self._view.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._view.setItemDelegate(MacroItemDelegate(self._view))
+        self._view.setMouseTracking(True)   # so the delegate's hover highlight updates live
+        self._view.setSpacing(1)            # gap between rows so cards read as separate items (halved from 3)
+        self._view.setFrameShape(QFrame.Shape.NoFrame)
+        # QListView's viewport defaults to the Base palette role, but
+        # ActionsPanel's plain QWidget panel uses Window -- match that so
+        # the two columns share the same background instead of looking like
+        # two different panels.
+        self._view.viewport().setBackgroundRole(QPalette.ColorRole.Window)
+        self._view.selectionModel().currentChanged.connect(self._on_current_changed)
 
         outer_layout.addWidget(label)
         outer_layout.addWidget(line)
-        outer_layout.addWidget(scroll, 1)
+        outer_layout.addWidget(self._view, 1)
         self.setFixedWidth(200)
 
-    def _on_item_clicked(self, item: MacroItem):
-        if self._selected_item is item:
-            self._deselect_current()
+    def _on_current_changed(self, current, previous):
+        if not current.isValid():
             self.selection_changed.emit(None)
             return
-        self._deselect_current()
-        self._selected_item = item
-        item.set_selected(True)
-        item.destroyed.connect(self._on_selected_destroyed)
-        self.selection_changed.emit(item)
+        self.selection_changed.emit(self._model.row_at(current.row()))
 
-    def _deselect_current(self):
-        if self._selected_item is not None:
-            try:
-                self._selected_item.destroyed.disconnect(self._on_selected_destroyed)
-                self._selected_item.set_selected(False)
-            except RuntimeError:
-                pass
-            self._selected_item = None
-
-    def _on_selected_destroyed(self):
-        self._selected_item = None
-        self.selection_changed.emit(None)
+    def load_actions(self, actions: list):
+        """Replace the current macro with a list of action objects from a recording."""
+        self._model.set_rows(group_actions(actions))
 
     def get_actions(self):
-        layout = self._drop_zone._layout
-        actions = []
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-            if item is None:
-                continue
-            widget = item.widget()
-            if isinstance(widget, MacroItem):
-                actions.append(widget.action)
-        return actions
+        rows = [self._model.row_at(i) for i in range(self._model.rowCount())]
+        return ungroup_rows(rows)
+
+    def on_row_changed(self, row):
+        """Connected to OptionsPanel.row_changed -- repaints the row after an edit."""
+        i = self._model.row_index_of(row)
+        if i is not None:
+            self._model.replace_row(i, row)
+
+    def expand_row(self, row):
+        """Connected to OptionsPanel.expand_requested -- splits a collapsed
+        move-group row into its individual MoveCursorAction rows."""
+        i = self._model.row_index_of(row)
+        if i is None or not row.is_group():
+            return
+        expanded = [MacroRow([a], configured=True) for a in row.actions]
+        self._model.replace_group_with_rows(i, expanded)

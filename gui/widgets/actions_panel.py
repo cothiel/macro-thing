@@ -47,12 +47,25 @@ class _DropZone(QWidget):
 
     def dropEvent(self, event):
         item = get_dragged_item()
-        if item is None or item.is_template:
-            event.ignore()
+        if item is not None:
+            # Legacy path: dragged-from widget is still a real MacroItem.
+            if item.is_template:
+                event.ignore()
+                return
+            item.setParent(None)
+            item.deleteLater()
+            event.acceptProposedAction()
             return
-        item.setParent(None)
-        item.deleteLater()
-        event.acceptProposedAction()
+
+        # Dragged from MacroPanel's QListView -- no MacroItem widget exists
+        # for a real macro row anymore. Accepting a MoveAction here makes
+        # Qt remove the row from the source model automatically.
+        if event.mimeData().hasFormat("application/x-macro-row-index"):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.acceptProposedAction()
+            return
+
+        event.ignore()
 
 
 class ActionsPanel(QWidget):

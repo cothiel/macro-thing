@@ -127,12 +127,31 @@ class MoveCursorAction(BaseAction):
         '''
             If a start coord is designated, instantly jump to (start_x, start_y) first.
             Then move to (end_x, end_y) over duration seconds.
-            Note: the moveTo call cannot be interrupted mid-motion.
+            Note: for duration >= pyautogui.MINIMUM_DURATION the moveTo call
+            cannot be interrupted mid-motion.
         '''
         print(f"Moving cursor to ({self.end_x}, {self.end_y}) over {self.duration}s")
         if self.start_x is not None and self.start_y is not None:
             pyautogui.moveTo(self.start_x, self.start_y)
-        pyautogui.moveTo(self.end_x, self.end_y, duration=self.duration)
+        if 0 < self.duration < pyautogui.MINIMUM_DURATION:
+            # pyautogui silently treats any duration below MINIMUM_DURATION as
+            # instantaneous, discarding the elapsed time entirely. That's fine
+            # for a single hand-placed move, but a recorded mouse path is
+            # replayed as many short MoveCursorActions back-to-back, so
+            # dropping each one compounds into large timing drift. Time it
+            # ourselves instead, then snap to the final position.
+            deadline = time.time() + self.duration
+            while time.time() < deadline:
+                if stop_event and stop_event.is_set():
+                    return
+                if pause_event:
+                    pause_event.wait()
+                    if stop_event and stop_event.is_set():
+                        return
+                time.sleep(min(0.01, max(0, deadline - time.time())))
+            pyautogui.moveTo(self.end_x, self.end_y)
+        else:
+            pyautogui.moveTo(self.end_x, self.end_y, duration=self.duration)
 
     def to_dict(self):
         return {
@@ -378,4 +397,27 @@ class HoldKeyAction(BaseAction):
             "Type": "HoldKey",
             "key": self.key,
             "duration": self.duration,
+        }
+
+
+class ScrollAction(BaseAction):
+    def __init__(self, x, y, dy, dx=0):
+        self.x = x
+        self.y = y
+        self.dy = dy   # positive = up, negative = down
+        self.dx = dx   # positive = right, negative = left
+
+    def execute(self, stop_event=None, pause_event=None):
+        if self.dy != 0:
+            pyautogui.scroll(self.dy, x=self.x, y=self.y)
+        if self.dx != 0:
+            pyautogui.hscroll(self.dx, x=self.x, y=self.y)
+
+    def to_dict(self):
+        return {
+            "Type": "Scroll",
+            "x": self.x,
+            "y": self.y,
+            "dy": self.dy,
+            "dx": self.dx,
         }

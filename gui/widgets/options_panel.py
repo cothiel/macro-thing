@@ -434,6 +434,37 @@ class _TypeTextOptions(_BaseOptions):
         action.interval = self._interval.value()
 
 
+class _MoveGroupOptions(_BaseOptions):
+    """Shown when a collapsed move-group MacroRow is selected. Read-only
+    summary plus a single explicit 'Expand' action -- editing individual
+    samples happens after expanding, not here (auto-expanding on every
+    selection would reintroduce the wall-of-rows problem grouping solves)."""
+    expand_clicked = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        self._summary = QLabel()
+        self._summary.setWordWrap(True)
+        expand_btn = QPushButton("Expand into individual moves")
+        expand_btn.clicked.connect(lambda: self.expand_clicked.emit(self._action))
+        form.addRow(self._summary)
+        form.addRow(expand_btn)
+
+    def _populate(self, row):
+        first, last = row.actions[0], row.actions[-1]
+        total_duration = sum(a.duration for a in row.actions)
+        self._summary.setText(
+            f"{len(row.actions)} move samples\n"
+            f"({first.end_x}, {first.end_y}) -> ({last.end_x}, {last.end_y})\n"
+            f"Total duration: {total_duration:.2f}s"
+        )
+
+    def _apply(self, row):
+        pass  # no editable fields here; the Expand button bypasses _emit entirely
+
+
 class _HoldKeyOptions(_BaseOptions):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -459,9 +490,12 @@ class _HoldKeyOptions(_BaseOptions):
 # --- panel ---
 
 class OptionsPanel(QWidget):
+    row_changed = Signal(object)        # replaces direct macro_item.refresh()/mark_configured()
+    expand_requested = Signal(object)   # user clicked "Expand" on a move-group row
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._current_item = None
+        self._current_row = None
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(0, 10, 0, 0)
@@ -476,6 +510,7 @@ class OptionsPanel(QWidget):
 
         self._stack = QStackedWidget()
         self._blank = QWidget()
+        self._move_group_widget = _MoveGroupOptions()
 
         self._widgets: dict[str, _BaseOptions] = {
             "Click":       _ClickOptions(),
@@ -490,6 +525,8 @@ class OptionsPanel(QWidget):
         }
 
         self._stack.addWidget(self._blank)
+        self._stack.addWidget(self._move_group_widget)
+        self._move_group_widget.expand_clicked.connect(self.expand_requested)
         for w in self._widgets.values():
             self._stack.addWidget(w)
             w.changed.connect(self._on_changed)
@@ -498,12 +535,16 @@ class OptionsPanel(QWidget):
         outer_layout.addWidget(line)
         outer_layout.addWidget(self._stack, 1)
 
-    def show_for(self, macro_item):
-        self._current_item = macro_item
-        if macro_item is None:
+    def show_for(self, row):
+        self._current_row = row
+        if row is None:
             self._stack.setCurrentWidget(self._blank)
             return
-        action = macro_item.action
+        if row.is_group():
+            self._move_group_widget.load(row)
+            self._stack.setCurrentWidget(self._move_group_widget)
+            return
+        action = row.actions[0]
         action_type = action.to_dict().get("Type", "")
         widget = self._widgets.get(action_type)
         if widget:
@@ -513,6 +554,6 @@ class OptionsPanel(QWidget):
             self._stack.setCurrentWidget(self._blank)
 
     def _on_changed(self):
-        if self._current_item is not None:
-            self._current_item.refresh()
-            self._current_item.mark_configured()
+        if self._current_row is not None:
+            self._current_row.mark_configured()
+            self.row_changed.emit(self._current_row)

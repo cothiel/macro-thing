@@ -1,5 +1,8 @@
+import pyautogui
 from PySide6.QtWidgets import QApplication
 from gui.main_window import MainWindow
+
+pyautogui.PAUSE = 0
 
 app = QApplication([])
 window = MainWindow()
