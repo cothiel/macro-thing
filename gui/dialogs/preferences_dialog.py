@@ -70,6 +70,21 @@ class PreferencesDialog(QDialog):
         )
         editor_layout.addRow("Default wait duration:", self.default_wait_spin)
 
+        self.merge_wait_spin = QDoubleSpinBox()
+        self.merge_wait_spin.setRange(0.0, 5.0)
+        self.merge_wait_spin.setDecimals(2)
+        self.merge_wait_spin.setSingleStep(0.05)
+        self.merge_wait_spin.setSuffix(" s")
+        self.merge_wait_spin.setToolTip(
+            "A Wait shorter than this, sandwiched between two move bursts, is shown as "
+            "part of the same Move row instead of splitting it into separate rows. "
+            "Set to 0 to never merge -- every wait always gets its own row."
+        )
+        self.merge_wait_spin.setValue(
+            self._settings.value("editor/move_merge_wait_threshold", 0.3, type=float)
+        )
+        editor_layout.addRow("Merge short waits under:", self.merge_wait_spin)
+
         layout.addWidget(editor_group)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -82,6 +97,7 @@ class PreferencesDialog(QDialog):
         self._settings.setValue("playback/repeat_count", self.repeat_count_spin.value())
         self._settings.setValue("playback/continuous", self.continuous_cb.isChecked())
         self._settings.setValue("editor/default_wait_seconds", self.default_wait_spin.value())
+        self._settings.setValue("editor/move_merge_wait_threshold", self.merge_wait_spin.value())
         self.accept()
 
     @staticmethod
@@ -99,3 +115,7 @@ class PreferencesDialog(QDialog):
     @staticmethod
     def default_wait_seconds() -> float:
         return QSettings("tinytask", "tinytask").value("editor/default_wait_seconds", 1.0, type=float)
+
+    @staticmethod
+    def move_merge_wait_threshold() -> float:
+        return QSettings("tinytask", "tinytask").value("editor/move_merge_wait_threshold", 0.3, type=float)

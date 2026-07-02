@@ -63,6 +63,38 @@ def _is_modifier(key: str) -> bool:
     return key in _MODIFIER_KEYS
 
 
+def _actions_for_move_sample(x, y, gap: float) -> list:
+    """
+    Shared by translate_precision's mouse_move handling and
+    build_move_path(): a gap this large means the cursor was stationary
+    (nothing fires while it isn't moving), so it's represented as an
+    explicit pause followed by an instant jump rather than a slow glide;
+    a small gap stays embedded in the move's own `duration` so it renders
+    as part of the same collapsed group in the editor.
+    """
+    duration = round(max(0.0, gap), 4)
+    if duration > _MOVE_WAIT_THRESHOLD:
+        return [WaitAction(duration), MoveCursorAction(x, y, duration=0.0)]
+    return [MoveCursorAction(x, y, duration=duration)]
+
+
+def build_move_path(samples: list) -> list:
+    """
+    Convert a chronological list of (x, y, timestamp) samples -- e.g.
+    captured while a user drags to redraw a move group's path -- into a
+    list of BaseAction objects, using the same gap-preserving logic as a
+    real recording. `timestamp` is seconds from an arbitrary common origin
+    (e.g. time.monotonic() deltas); the first sample's own gap is ignored
+    since there's nothing before it to wait on.
+    """
+    actions = []
+    prev_ts = samples[0][2] if samples else 0.0
+    for x, y, ts in samples:
+        actions.extend(_actions_for_move_sample(x, y, ts - prev_ts))
+        prev_ts = ts
+    return actions
+
+
 def translate_precision(events: list) -> list:
     """
     Convert a flat list of raw recorder event dicts into a list of BaseAction objects.
@@ -89,15 +121,7 @@ def translate_precision(events: list) -> list:
 
         # --- mouse move ---
         if ev["type"] == "mouse_move":
-            # A gap this large means the mouse was stationary (pynput only
-            # fires on_move when the cursor actually changes position), not
-            # that the user dragged slowly -- replay it as an explicit pause
-            # followed by an instant jump, not a slow glide across the screen.
-            duration = round(max(0.0, gap), 4)
-            if duration > _MOVE_WAIT_THRESHOLD:
-                actions.append(WaitAction(duration))
-                duration = 0.0
-            actions.append(MoveCursorAction(ev["x"], ev["y"], duration=duration))
+            actions.extend(_actions_for_move_sample(ev["x"], ev["y"], gap))
             prev_ts = ev["timestamp"]
             i += 1
 

@@ -1,9 +1,15 @@
+import time
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QFrame, QStackedWidget,
     QFormLayout, QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox, QCheckBox,
     QPushButton, QApplication,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QPoint, QTimer
+from PySide6.QtGui import QPainter, QPen, QColor, QPolygon
+
+from engine.actions import MoveCursorAction
+from engine.precision_translator import build_move_path
 
 
 # --- key conversion ---
@@ -117,6 +123,171 @@ class _ScreenPicker(QWidget):
         elif event.button() == Qt.MouseButton.RightButton:
             self.cancelled.emit()
             self.close()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            self.close()
+
+
+# --- path draw overlay ---
+
+def _abs_to_local(widget, abs_x, abs_y) -> QPoint:
+    """Map an absolute physical-pixel screen coordinate (as stored on a
+    MoveCursorAction) to `widget`'s local coordinate space -- the inverse of
+    the abs_x/abs_y computation in _PathDrawOverlay._screen_point(). Shared
+    by _PathDrawOverlay (drawing the previous path as reference while
+    redrawing) and the standalone path preview (drawing a group's existing
+    path with no redraw involved)."""
+    ratio = QApplication.primaryScreen().devicePixelRatio()
+    return widget.mapFromGlobal(QPoint(round(abs_x / ratio), round(abs_y / ratio)))
+
+
+class _PathPaintLayer(QWidget):
+    """Pure visual layer, stacked on top of _PathDrawOverlay for rendering
+    only. WA_TransparentForMouseEvents (WS_EX_TRANSPARENT on Windows) is the
+    OS-sanctioned way to make a window truly click-through, so this widget
+    can never be the thing letting clicks reach whatever's underneath --
+    that's what a per-pixel-transparent *interactive* window risks doing,
+    which is why all real input capture stays on the separate
+    _PathDrawOverlay window using the same proven bulk-opacity trick as
+    _ScreenPicker instead."""
+
+    _PREVIOUS_COLOR = QColor(255, 255, 255, 130)
+    _LIVE_COLOR = QColor("#0078d4")
+
+    def __init__(self, geometry):
+        _flags = (Qt.WindowType.FramelessWindowHint |
+                  Qt.WindowType.WindowStaysOnTopHint |
+                  Qt.WindowType.Tool)
+        super().__init__(None, _flags)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setGeometry(geometry)
+        self.previous_points = []   # QPoint, local coords
+        self.live_points = []       # QPoint, local coords
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        if len(self.previous_points) >= 2:
+            pen = QPen(self._PREVIOUS_COLOR)
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawPolyline(QPolygon(self.previous_points))
+
+        if len(self.live_points) >= 2:
+            pen = QPen(self._LIVE_COLOR)
+            pen.setWidth(3)
+            painter.setPen(pen)
+            painter.drawPolyline(QPolygon(self.live_points))
+
+        if self.live_points:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self._LIVE_COLOR)
+            painter.drawEllipse(self.live_points[-1], 5, 5)
+
+
+class _PathDrawOverlay(QWidget):
+    """Same always-on-top capture surface as _ScreenPicker (whole-window
+    near-zero opacity, not per-pixel transparency -- that's what proved
+    reliable at blocking clicks from reaching whatever's underneath), but
+    records a dragged path instead of a single click. A separate
+    _PathPaintLayer window, stacked on top and explicitly click-through,
+    renders the path live without affecting input capture at all. Sampling
+    is scoped strictly to the press-to-release window -- nothing is
+    captured before the button goes down or after it comes back up, and no
+    other input (keys, other buttons) is ever recorded, only (x, y, time)
+    while dragging."""
+    path_drawn = Signal(list)   # list of (x, y, elapsed_seconds) tuples
+    cancelled = Signal()
+
+    def __init__(self, previous_points=None):
+        _flags = (Qt.WindowType.FramelessWindowHint |
+                  Qt.WindowType.WindowStaysOnTopHint)
+        super().__init__(None, _flags)
+        self.setWindowOpacity(0.01)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        geometry = QApplication.primaryScreen().virtualGeometry()
+        self.setGeometry(geometry)
+
+        self._hint = QLabel(
+            "  Click and hold to draw a path, release to finish  |  Esc to cancel  \n"
+            "  White dashed = previous path   Blue = new path  "
+        )
+        self._hint.setWindowFlags(_flags | Qt.WindowType.Tool)
+        self._hint.setStyleSheet(
+            "background:#1e1e1e; color:white; padding:8px 14px;"
+            "border-radius:4px; font-size:13px;"
+        )
+        self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._hint.adjustSize()
+        sr = QApplication.primaryScreen().geometry()
+        self._hint.move(sr.center().x() - self._hint.width() // 2, 20)
+        self._hint.show()
+
+        self._drawing = False
+        self._start_time = 0.0
+        self._samples = []   # (x, y, elapsed_seconds) in absolute screen coords -- the real data
+
+        self._paint_layer = _PathPaintLayer(geometry)
+        self._paint_layer.previous_points = [_abs_to_local(self, x, y) for x, y in (previous_points or [])]
+        self._paint_layer.show()
+
+        self.show()
+        self.activateWindow()
+        self.setFocus()
+        # Explicit OS-level grabs, on top of activation, to guarantee Esc
+        # is caught instantly rather than depending on focus/activation
+        # timing being exactly right.
+        self.grabMouse()
+        self.grabKeyboard()
+
+    def closeEvent(self, event):
+        self.releaseKeyboard()
+        self.releaseMouse()
+        self._paint_layer.close()
+        self._hint.close()
+        super().closeEvent(event)
+
+    def _screen_point(self, event):
+        pos = event.globalPosition().toPoint()
+        screen = QApplication.screenAt(pos)
+        ratio = screen.devicePixelRatio() if screen else 1.0
+        return round(pos.x() * ratio), round(pos.y() * ratio)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drawing = True
+            self._start_time = time.monotonic()
+            x, y = self._screen_point(event)
+            self._samples = [(x, y, 0.0)]
+            self._paint_layer.live_points = [event.position().toPoint()]
+            self._paint_layer.update()
+        elif event.button() == Qt.MouseButton.RightButton:
+            self.cancelled.emit()
+            self.close()
+
+    def mouseMoveEvent(self, event):
+        if not self._drawing:
+            return
+        x, y = self._screen_point(event)
+        self._samples.append((x, y, time.monotonic() - self._start_time))
+        self._paint_layer.live_points.append(event.position().toPoint())
+        self._paint_layer.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or not self._drawing:
+            return
+        self._drawing = False
+        if len(self._samples) >= 2:
+            self.path_drawn.emit(self._samples)
+        else:
+            self.cancelled.emit()
+        self.close()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -440,6 +611,9 @@ class _MoveGroupOptions(_BaseOptions):
     samples happens after expanding, not here (auto-expanding on every
     selection would reintroduce the wall-of-rows problem grouping solves)."""
     expand_clicked = Signal(object)
+    path_redrawn = Signal(object, list)   # (row, new_actions)
+
+    _PREVIEW_DURATION_MS = 2000
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -447,22 +621,56 @@ class _MoveGroupOptions(_BaseOptions):
         form.setContentsMargins(8, 8, 8, 8)
         self._summary = QLabel()
         self._summary.setWordWrap(True)
+        preview_btn = QPushButton("Preview path")
+        preview_btn.setToolTip("Briefly show this path on-screen so you can see what it does.")
+        preview_btn.clicked.connect(self._preview_path)
+        draw_btn = QPushButton("Draw new path...")
+        draw_btn.setToolTip("Click and hold on-screen to trace a new path; release to finish.")
+        draw_btn.clicked.connect(self._start_draw)
         expand_btn = QPushButton("Expand into individual moves")
         expand_btn.clicked.connect(lambda: self.expand_clicked.emit(self._action))
         form.addRow(self._summary)
+        form.addRow(preview_btn)
+        form.addRow(draw_btn)
         form.addRow(expand_btn)
+
+    def _move_points(self, row):
+        return [(a.end_x, a.end_y) for a in row.actions if isinstance(a, MoveCursorAction)]
 
     def _populate(self, row):
         first, last = row.actions[0], row.actions[-1]
-        total_duration = sum(a.duration for a in row.actions)
+        move_count = sum(1 for a in row.actions if isinstance(a, MoveCursorAction))
+        pause_count = len(row.actions) - move_count
+        total_duration = sum(
+            a.duration if isinstance(a, MoveCursorAction) else a.seconds
+            for a in row.actions
+        )
+        pause_note = f"\nIncludes {pause_count} short pause{'s' if pause_count != 1 else ''}" if pause_count else ""
         self._summary.setText(
-            f"{len(row.actions)} move samples\n"
+            f"{move_count} move samples{pause_note}\n"
             f"({first.end_x}, {first.end_y}) -> ({last.end_x}, {last.end_y})\n"
             f"Total duration: {total_duration:.2f}s"
         )
 
     def _apply(self, row):
-        pass  # no editable fields here; the Expand button bypasses _emit entirely
+        pass  # no editable fields here; the buttons bypass _emit entirely
+
+    def _preview_path(self):
+        geometry = QApplication.primaryScreen().virtualGeometry()
+        layer = _PathPaintLayer(geometry)
+        layer.live_points = [_abs_to_local(layer, x, y) for x, y in self._move_points(self._action)]
+        layer.show()
+        self._preview_layer = layer   # keep a reference so it isn't GC'd before the timer fires
+        QTimer.singleShot(self._PREVIEW_DURATION_MS, layer.close)
+
+    def _start_draw(self):
+        previous_points = self._move_points(self._action)
+        self._overlay = _PathDrawOverlay(previous_points=previous_points)
+        self._overlay.path_drawn.connect(self._on_path_drawn)
+
+    def _on_path_drawn(self, samples):
+        new_actions = build_move_path(samples)
+        self.path_redrawn.emit(self._action, new_actions)
 
 
 class _HoldKeyOptions(_BaseOptions):
@@ -492,6 +700,7 @@ class _HoldKeyOptions(_BaseOptions):
 class OptionsPanel(QWidget):
     row_changed = Signal(object)        # replaces direct macro_item.refresh()/mark_configured()
     expand_requested = Signal(object)   # user clicked "Expand" on a move-group row
+    path_redrawn = Signal(object, list) # user drew a new path for a move-group row: (row, new_actions)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -527,6 +736,7 @@ class OptionsPanel(QWidget):
         self._stack.addWidget(self._blank)
         self._stack.addWidget(self._move_group_widget)
         self._move_group_widget.expand_clicked.connect(self.expand_requested)
+        self._move_group_widget.path_redrawn.connect(self.path_redrawn)
         for w in self._widgets.values():
             self._stack.addWidget(w)
             w.changed.connect(self._on_changed)

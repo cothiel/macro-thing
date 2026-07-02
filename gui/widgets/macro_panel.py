@@ -94,6 +94,21 @@ class MacroListModel(QAbstractListModel):
 
         return False
 
+    def removeRows(self, row, count, parent=QModelIndex()):
+        # Required for dragging a row out to another widget (e.g. dropping
+        # it on ActionsPanel to delete it): after a cross-widget drop is
+        # accepted as a MoveAction, Qt's own drag machinery calls this on
+        # the *source* model to remove the dragged row. QAbstractListModel's
+        # default implementation is a no-op, so without this override the
+        # drop looks like it succeeds on the target side but the row never
+        # actually leaves this list.
+        if parent.isValid() or row < 0 or count <= 0 or row + count > len(self._rows):
+            return False
+        self.beginRemoveRows(QModelIndex(), row, row + count - 1)
+        del self._rows[row:row + count]
+        self.endRemoveRows()
+        return True
+
     # --- helpers used by MacroPanel, not part of QAbstractItemModel API ---
 
     def set_rows(self, rows):
@@ -252,7 +267,8 @@ class MacroPanel(QWidget):
 
     def load_actions(self, actions: list):
         """Replace the current macro with a list of action objects from a recording."""
-        self._model.set_rows(group_actions(actions))
+        threshold = PreferencesDialog.move_merge_wait_threshold()
+        self._model.set_rows(group_actions(actions, merge_wait_threshold=threshold))
 
     def get_actions(self):
         rows = [self._model.row_at(i) for i in range(self._model.rowCount())]
@@ -272,3 +288,29 @@ class MacroPanel(QWidget):
             return
         expanded = [MacroRow([a], configured=True) for a in row.actions]
         self._model.replace_group_with_rows(i, expanded)
+        # The old group row object is gone; clear selection rather than let
+        # the options panel keep showing a summary for a row that no longer
+        # exists (Qt won't refire currentChanged since the index itself
+        # didn't move, only what's at it).
+        self._view.clearSelection()
+        self._view.setCurrentIndex(QModelIndex())
+        self.selection_changed.emit(None)
+
+    def redraw_group(self, row, new_actions):
+        """Connected to OptionsPanel.path_redrawn -- replaces a move group's
+        internal actions with a freshly drawn path. A pause mid-drag becomes
+        a WaitAction (see build_move_path), so the new actions aren't
+        necessarily one homogeneous MoveCursorAction run any more -- re-run
+        them through group_actions() so a paused drag correctly becomes
+        multiple rows (Move/Wait/Move/...) instead of one MacroRow with
+        mixed action types, which the group summary UI can't handle."""
+        i = self._model.row_index_of(row)
+        if i is None:
+            return
+        threshold = PreferencesDialog.move_merge_wait_threshold()
+        new_rows = group_actions(new_actions, merge_wait_threshold=threshold)
+        self._model.replace_group_with_rows(i, new_rows)
+        # Old row object is gone; refresh the options panel to whatever's
+        # now at that position (Qt won't refire currentChanged on its own
+        # since the index itself didn't move, only what's at it).
+        self.selection_changed.emit(new_rows[0] if new_rows else None)

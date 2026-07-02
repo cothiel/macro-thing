@@ -12,7 +12,7 @@ from engine.actions import (
     WaitAction, PressKeyAction, HotkeyAction, TypeTextAction, HoldKeyAction
 )
 from engine.player import MacroPlayer
-from engine.precision_translator import translate_precision
+from engine.precision_translator import translate_precision, build_move_path
 
 
 class _BlockingAction:
@@ -560,6 +560,37 @@ class TestPrecisionTranslatorTiming(unittest.TestCase):
         self.assertEqual(actions[0].seconds, 2.5)
         self.assertIsInstance(actions[1], MoveCursorAction)
         self.assertEqual(actions[1].duration, 0.0)
+
+
+class TestBuildMovePath(unittest.TestCase):
+    """build_move_path() powers the 'draw new path' redraw feature: it
+    converts (x, y, elapsed_seconds) samples captured from a mouse drag into
+    the same kind of MoveCursorAction/WaitAction sequence a real recording
+    would produce."""
+
+    def test_empty_samples_produce_no_actions(self):
+        self.assertEqual(build_move_path([]), [])
+
+    def test_first_sample_has_zero_duration(self):
+        actions = build_move_path([(10, 20, 0.0)])
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], MoveCursorAction)
+        self.assertEqual((actions[0].end_x, actions[0].end_y, actions[0].duration), (10, 20, 0.0))
+
+    def test_closely_spaced_samples_stay_embedded_moves(self):
+        samples = [(0, 0, 0.0), (5, 5, 0.01), (10, 10, 0.02)]
+        actions = build_move_path(samples)
+        self.assertTrue(all(isinstance(a, MoveCursorAction) for a in actions))
+        self.assertEqual([a.duration for a in actions], [0.0, 0.01, 0.01])
+
+    def test_pause_mid_drag_becomes_wait_then_jump(self):
+        # User held the button but paused (no movement) for a while mid-drag.
+        samples = [(0, 0, 0.0), (5, 5, 0.02), (5, 5, 0.02), (50, 50, 0.30)]
+        actions = build_move_path(samples)
+        types = [type(a).__name__ for a in actions]
+        self.assertIn('WaitAction', types)
+        wait = next(a for a in actions if isinstance(a, WaitAction))
+        self.assertAlmostEqual(wait.seconds, 0.28, places=3)
 
 
 if __name__ == '__main__':

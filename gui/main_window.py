@@ -135,6 +135,7 @@ class MainWindow(QMainWindow):
         self.macro_panel.selection_changed.connect(self.options_panel.show_for)
         self.options_panel.row_changed.connect(self.macro_panel.on_row_changed)
         self.options_panel.expand_requested.connect(self.macro_panel.expand_row)
+        self.options_panel.path_redrawn.connect(self.macro_panel.redraw_group)
         self._recorder_bridge.hotkey_triggered.connect(self._on_record_hotkey)
         self._player_bridge.hotkey_triggered.connect(self._on_play_hotkey)
     
