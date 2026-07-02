@@ -12,6 +12,7 @@ from engine.actions import (
     WaitAction, PressKeyAction, HotkeyAction, TypeTextAction, HoldKeyAction
 )
 from engine.player import MacroPlayer
+from engine.precision_translator import translate_precision
 
 
 class _BlockingAction:
@@ -35,6 +36,26 @@ class _BlockingAction:
 
     def to_dict(self):
         return {"Type": "Blocking"}
+
+
+class _CountingAction:
+    """
+    Test helper that counts how many times it has executed, and sets a
+    'ready' event once it reaches a target count -- lets a test wait for N
+    executions (e.g. across repeat/continuous loops) without a fixed sleep.
+    """
+    def __init__(self, target_count, ready_event):
+        self.count = 0
+        self._target = target_count
+        self._ready = ready_event
+
+    def execute(self, stop_event=None, pause_event=None):
+        self.count += 1
+        if self.count >= self._target:
+            self._ready.set()
+
+    def to_dict(self):
+        return {"Type": "Counting"}
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +451,115 @@ class TestMacroPlayer(unittest.TestCase):
         self.assertIs(player._thread, thread1)
         action.release()
         player._thread.join(timeout=1)
+
+    def test_repeat_count_executes_action_n_times(self):
+        action = MagicMock()
+        player = MacroPlayer([action], repeat_count=4)
+        player.start()
+        player._thread.join(timeout=2)
+        self.assertEqual(action.execute.call_count, 4)
+
+    def test_repeat_count_default_is_single_pass(self):
+        action = MagicMock()
+        player = MacroPlayer([action])
+        player.start()
+        player._thread.join(timeout=2)
+        self.assertEqual(action.execute.call_count, 1)
+
+    def test_continuous_playback_loops_until_stopped(self):
+        ready = threading.Event()
+        action = _CountingAction(target_count=3, ready_event=ready)
+        player = MacroPlayer([action], continuous=True)
+        player.start()
+        self.assertTrue(ready.wait(timeout=2))
+        player.stop()
+        player._thread.join(timeout=2)
+        self.assertGreaterEqual(action.count, 3)
+
+    def test_continuous_ignores_repeat_count(self):
+        ready = threading.Event()
+        action = _CountingAction(target_count=5, ready_event=ready)
+        player = MacroPlayer([action], repeat_count=1, continuous=True)
+        player.start()
+        self.assertTrue(ready.wait(timeout=2))
+        player.stop()
+        player._thread.join(timeout=2)
+        self.assertGreaterEqual(action.count, 5)
+
+    def test_continuous_with_no_actions_completes_immediately(self):
+        callback = MagicMock()
+        player = MacroPlayer([], on_complete=callback, continuous=True)
+        player.start()
+        player._thread.join(timeout=1)
+        self.assertFalse(player.is_running)
+        callback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# precision_translator
+# ---------------------------------------------------------------------------
+
+class TestPrecisionTranslatorKeyChords(unittest.TestCase):
+
+    def test_overlapping_plain_keys_are_not_a_hotkey(self):
+        # Fast-typing rollover: 'e' pressed before 'h' is released.
+        events = [
+            {'type': 'key_press', 'key': 'h', 'timestamp': 0.000},
+            {'type': 'key_press', 'key': 'e', 'timestamp': 0.050},
+            {'type': 'key_release', 'key': 'h', 'timestamp': 0.060},
+            {'type': 'key_release', 'key': 'e', 'timestamp': 0.110},
+        ]
+        actions = translate_precision(events)
+        self.assertTrue(all(isinstance(a, PressKeyAction) for a in actions))
+        self.assertEqual([a.key for a in actions], ['h', 'e'])
+
+    def test_overlapping_keys_with_modifier_is_a_hotkey(self):
+        events = [
+            {'type': 'key_press', 'key': 'ctrl_l', 'timestamp': 0.000},
+            {'type': 'key_press', 'key': 'c', 'timestamp': 0.030},
+            {'type': 'key_release', 'key': 'c', 'timestamp': 0.060},
+            {'type': 'key_release', 'key': 'ctrl_l', 'timestamp': 0.090},
+        ]
+        actions = translate_precision(events)
+        self.assertEqual(len(actions), 1)
+        self.assertIsInstance(actions[0], HotkeyAction)
+        self.assertEqual(actions[0].keys, ['ctrlleft', 'c'])
+
+    def test_no_key_dropped_when_overlap_rejected_as_chord(self):
+        events = [
+            {'type': 'key_press', 'key': 'a', 'timestamp': 0.000},
+            {'type': 'key_press', 'key': 'b', 'timestamp': 0.010},
+            {'type': 'key_press', 'key': 'c', 'timestamp': 0.020},
+            {'type': 'key_release', 'key': 'a', 'timestamp': 0.030},
+            {'type': 'key_release', 'key': 'b', 'timestamp': 0.040},
+            {'type': 'key_release', 'key': 'c', 'timestamp': 0.050},
+        ]
+        actions = translate_precision(events)
+        self.assertEqual([a.key for a in actions], ['a', 'b', 'c'])
+
+
+class TestPrecisionTranslatorTiming(unittest.TestCase):
+
+    def test_sub_threshold_gap_between_clicks_is_preserved(self):
+        events = [
+            {'type': 'mouse_button', 'x': 10, 'y': 10, 'button': 'left', 'pressed': True, 'timestamp': 0.000},
+            {'type': 'mouse_button', 'x': 10, 'y': 10, 'button': 'left', 'pressed': False, 'timestamp': 0.020},
+            {'type': 'mouse_button', 'x': 10, 'y': 10, 'button': 'left', 'pressed': True, 'timestamp': 0.045},
+            {'type': 'mouse_button', 'x': 10, 'y': 10, 'button': 'left', 'pressed': False, 'timestamp': 0.060},
+        ]
+        actions = translate_precision(events)
+        waits = [a.seconds for a in actions if isinstance(a, WaitAction)]
+        self.assertEqual(waits, [0.025])
+
+    def test_idle_gap_before_move_becomes_wait_then_instant_jump(self):
+        events = [
+            {'type': 'mouse_move', 'x': 10, 'y': 10, 'timestamp': 2.5},
+        ]
+        actions = translate_precision(events)
+        self.assertIsInstance(actions[0], WaitAction)
+        self.assertEqual(actions[0].seconds, 2.5)
+        self.assertIsInstance(actions[1], MoveCursorAction)
+        self.assertEqual(actions[1].duration, 0.0)
 
 
 if __name__ == '__main__':

@@ -8,9 +8,11 @@ from engine.actions import * # Apparently importing everything is "bad" but im d
 
 
 class MacroPlayer:
-    def __init__(self, actions, on_complete=None):
+    def __init__(self, actions, on_complete=None, repeat_count=1, continuous=False):
         self.actions = actions
         self.on_complete = on_complete
+        self.repeat_count = max(1, repeat_count)
+        self.continuous = continuous
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._pause_event.set()  # set = running, clear = paused
@@ -49,13 +51,19 @@ class MacroPlayer:
             self.resume()
 
     def _run(self):
-        for action in self.actions:
+        reps = 0
+        while self.actions and (self.continuous or reps < self.repeat_count):
+            for action in self.actions:
+                if self._stop_event.is_set():
+                    break
+                self._pause_event.wait()  # blocks here while paused
+                if self._stop_event.is_set():
+                    break
+                action.execute(self._stop_event, self._pause_event)
+
             if self._stop_event.is_set():
                 break
-            self._pause_event.wait()  # blocks here while paused
-            if self._stop_event.is_set():
-                break
-            action.execute(self._stop_event, self._pause_event)
+            reps += 1
 
         if self.on_complete and not self._stop_event.is_set():
             self.on_complete()

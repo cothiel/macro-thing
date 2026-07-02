@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QAbstractListModel, QModelIndex, QMimeData, QRect, QSize
 from PySide6.QtGui import QPainter, QColor, QPen, QPalette
 
+from engine.actions import WaitAction
+from gui.dialogs.preferences_dialog import PreferencesDialog
 from gui.widgets.macro_item import get_dragged_item
 from gui.widgets.macro_model import MacroRow, group_actions, ungroup_rows
 
@@ -79,8 +81,14 @@ class MacroListModel(QAbstractListModel):
             dragged = get_dragged_item()
             if dragged is None or not dragged.is_template:
                 return False
+            new_action = copy.deepcopy(dragged.action)
+            if isinstance(new_action, WaitAction):
+                # The template itself carries a fixed placeholder duration;
+                # use the user's configured default instead so they don't
+                # have to open the options panel and retype it every time.
+                new_action.seconds = PreferencesDialog.default_wait_seconds()
             self.beginInsertRows(QModelIndex(), row, row)
-            self._rows.insert(row, MacroRow([copy.deepcopy(dragged.action)], configured=False))
+            self._rows.insert(row, MacroRow([new_action], configured=False))
             self.endInsertRows()
             return True
 
@@ -127,10 +135,16 @@ class MacroItemDelegate(QStyledItemDelegate):
     items in the list rather than plain lines of text."""
 
     _ROW_HEIGHT = 32
+    _WAIT_ROW_HEIGHT = 13  # waits carry no parameters worth much space, and recordings can have many of them
     _RADIUS = 6
+
+    @staticmethod
+    def _is_wait_row(row) -> bool:
+        return row is not None and not row.is_group() and isinstance(row.actions[0], WaitAction)
 
     def paint(self, painter, option, index):
         row = index.data(MacroListModel.ActionRole)
+        is_wait = self._is_wait_row(row)
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
@@ -158,12 +172,18 @@ class MacroItemDelegate(QStyledItemDelegate):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         rect = option.rect.adjusted(1, 1, -1, -1)
+        radius = self._RADIUS * 0.5 if is_wait else self._RADIUS
         painter.setPen(border_pen)
         painter.setBrush(bg)
-        painter.drawRoundedRect(rect, self._RADIUS, self._RADIUS)
+        painter.drawRoundedRect(rect, radius, radius)
+
+        if is_wait:
+            font = painter.font()
+            font.setPointSizeF(max(6.0, font.pointSizeF() * 0.75))
+            painter.setFont(font)
 
         painter.setPen(text_color)
-        text_rect = rect.adjusted(10, 0, -22, 0)
+        text_rect = rect.adjusted(8 if is_wait else 10, 0, -22, 0)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                           row.label() if row is not None else "")
 
@@ -177,7 +197,9 @@ class MacroItemDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index):
-        return QSize(option.rect.width(), self._ROW_HEIGHT)
+        row = index.data(MacroListModel.ActionRole)
+        height = self._WAIT_ROW_HEIGHT if self._is_wait_row(row) else self._ROW_HEIGHT
+        return QSize(option.rect.width(), height)
 
 
 class MacroPanel(QWidget):

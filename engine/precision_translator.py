@@ -3,8 +3,19 @@ from engine.actions import (
     WaitAction, PressKeyAction, HoldKeyAction, HotkeyAction, ScrollAction,
 )
 
-# Minimum gap (seconds) between non-move events before a WaitAction is inserted.
-_WAIT_THRESHOLD = 0.05
+# Gap (seconds) above which a mouse-move's elapsed time gets promoted from
+# the move's own `duration` field into an explicit WaitAction + instant jump
+# instead. This is purely a display/grouping choice -- both paths already
+# reproduce the gap's exact duration (see MoveCursorAction.execute()) -- so
+# it can stay generous without costing any timing fidelity.
+_MOVE_WAIT_THRESHOLD = 0.05
+
+# Minimum gap (seconds) worth representing at all for click/key/scroll
+# events. Unlike moves, these events have no field to silently absorb a
+# sub-threshold gap into -- any gap this doesn't catch is simply dropped
+# from playback entirely, so this stays just above floating-point/rounding
+# noise rather than a "don't bother" cutoff.
+_MIN_MEANINGFUL_GAP = 0.001
 
 # Key held longer than this becomes HoldKeyAction; shorter becomes PressKeyAction.
 _HOLD_THRESHOLD = 0.15
@@ -35,6 +46,23 @@ def _pyautogui_key(key: str) -> str:
     return _KEY_MAP.get(key, key)
 
 
+# Raw pynput key names for modifier keys. Overlapping key-press intervals are
+# only ever treated as a deliberate hotkey chord when at least one of them is
+# a modifier (matching how virtually every real shortcut is composed, e.g.
+# ctrl+c, alt+tab). Plain letter/letter overlap is finger rollover from fast
+# typing, not an intentional combo, and should stay individual key presses.
+_MODIFIER_KEYS = {
+    "ctrl", "ctrl_l", "ctrl_r",
+    "shift", "shift_l", "shift_r",
+    "alt", "alt_l", "alt_r", "alt_gr",
+    "cmd", "cmd_l", "cmd_r",
+}
+
+
+def _is_modifier(key: str) -> bool:
+    return key in _MODIFIER_KEYS
+
+
 def translate_precision(events: list) -> list:
     """
     Convert a flat list of raw recorder event dicts into a list of BaseAction objects.
@@ -46,7 +74,9 @@ def translate_precision(events: list) -> list:
       key_press+release (short hold)  → PressKeyAction
       key_press+release (long hold)   → HoldKeyAction
       overlapping key_presses (chord) → HotkeyAction
-    WaitAction is inserted before non-move events when the gap exceeds _WAIT_THRESHOLD.
+    WaitAction is inserted before click/key/scroll events whenever there's any
+    meaningful gap, and before a move when that gap is large enough to be
+    worth showing as its own row (see _MIN_MEANINGFUL_GAP / _MOVE_WAIT_THRESHOLD).
     """
     actions = []
     prev_ts = 0.0
@@ -64,7 +94,7 @@ def translate_precision(events: list) -> list:
             # that the user dragged slowly -- replay it as an explicit pause
             # followed by an instant jump, not a slow glide across the screen.
             duration = round(max(0.0, gap), 4)
-            if duration > _WAIT_THRESHOLD:
+            if duration > _MOVE_WAIT_THRESHOLD:
                 actions.append(WaitAction(duration))
                 duration = 0.0
             actions.append(MoveCursorAction(ev["x"], ev["y"], duration=duration))
@@ -73,7 +103,7 @@ def translate_precision(events: list) -> list:
 
         # --- mouse button press ---
         elif ev["type"] == "mouse_button" and ev["pressed"]:
-            if gap > _WAIT_THRESHOLD:
+            if gap > _MIN_MEANINGFUL_GAP:
                 actions.append(WaitAction(round(gap, 3)))
 
             release_idx = _find_mouse_release(events, i, ev["button"])
@@ -111,7 +141,7 @@ def translate_precision(events: list) -> list:
 
         # --- mouse scroll ---
         elif ev["type"] == "mouse_scroll":
-            if gap > _WAIT_THRESHOLD:
+            if gap > _MIN_MEANINGFUL_GAP:
                 actions.append(WaitAction(round(gap, 3)))
             actions.append(ScrollAction(ev["x"], ev["y"], ev["dy"], ev["dx"]))
             prev_ts = ev["timestamp"]
@@ -119,17 +149,25 @@ def translate_precision(events: list) -> list:
 
         # --- key press ---
         elif ev["type"] == "key_press":
-            if gap > _WAIT_THRESHOLD:
+            if gap > _MIN_MEANINGFUL_GAP:
                 actions.append(WaitAction(round(gap, 3)))
 
             chord_keys, chord_end = _collect_chord(events, i)
+            is_chord = len(chord_keys) > 1 and chord_end != -1 and any(_is_modifier(k) for k in chord_keys)
 
-            if len(chord_keys) > 1 and chord_end != -1:
-                # Multiple keys pressed before any were released → hotkey chord.
+            if is_chord:
+                # Multiple keys held down together, and at least one is a
+                # modifier -> a deliberate hotkey (e.g. ctrl+c).
                 actions.append(HotkeyAction([_pyautogui_key(k) for k in chord_keys]))
                 prev_ts = events[chord_end]["timestamp"]
                 i = chord_end + 1
             else:
+                # Either a lone key, or plain keys that briefly overlapped
+                # from fast-typing finger rollover rather than a deliberate
+                # chord -- treat this one as its own press/hold. Advance only
+                # one event at a time (not to release_idx+1) so an
+                # overlapping partner key's own press isn't skipped over and
+                # silently dropped.
                 key = ev["key"]
                 release_idx = _find_key_release(events, i, key)
                 if release_idx == -1:
@@ -145,7 +183,7 @@ def translate_precision(events: list) -> list:
                     actions.append(PressKeyAction(pykey))
 
                 prev_ts = events[release_idx]["timestamp"]
-                i = release_idx + 1
+                i += 1
 
         # --- orphaned key release ---
         elif ev["type"] == "key_release":

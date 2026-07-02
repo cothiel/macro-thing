@@ -152,7 +152,12 @@ class MainWindow(QMainWindow):
     def on_play_toggled(self, checked):
         if checked:
             actions = self.macro_panel.get_actions()
-            self._player = MacroPlayer(actions, on_complete=self._player_bridge.finished.emit)
+            self._player = MacroPlayer(
+                actions,
+                on_complete=self._player_bridge.finished.emit,
+                repeat_count=PreferencesDialog.repeat_count(),
+                continuous=PreferencesDialog.continuous_playback_enabled(),
+            )
             self._player.start()
         else:
             if self._player:
