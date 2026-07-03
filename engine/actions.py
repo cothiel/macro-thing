@@ -492,3 +492,36 @@ class ScrollAction(BaseAction):
             "duration": self.duration,
             "speed": self.speed,
         }
+
+
+# Maps the "Type" tag each action's to_dict() emits back to its class. Every
+# action's to_dict() uses its own constructor's parameter names as the payload
+# keys (apart from "Type"), so reconstruction is just calling the class with
+# the remaining keys as keyword arguments -- no per-type from_dict needed.
+_ACTION_TYPES = {
+    "Click": ClickAction,
+    "RepeatClick": RepeatClickAction,
+    "MoveCursor": MoveCursorAction,
+    "ClickDrag": ClickDragAction,
+    "Wait": WaitAction,
+    "PressKey": PressKeyAction,
+    "Hotkey": HotkeyAction,
+    "TypeText": TypeTextAction,
+    "HoldKey": HoldKeyAction,
+    "Scroll": ScrollAction,
+}
+
+
+def action_from_dict(data: dict) -> BaseAction:
+    """Reconstruct an action object from a to_dict() payload.
+
+    Raises ValueError for an unknown/missing "Type", and TypeError if the
+    payload's keys don't match the target action's constructor parameters."""
+    if not isinstance(data, dict):
+        raise ValueError(f"Action entry is not an object: {data!r}")
+    fields = dict(data)
+    type_name = fields.pop("Type", None)
+    action_cls = _ACTION_TYPES.get(type_name)
+    if action_cls is None:
+        raise ValueError(f"Unknown action type: {type_name!r}")
+    return action_cls(**fields)

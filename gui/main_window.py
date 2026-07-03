@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QSizePolicy,
     QFrame,
+    QFileDialog,
+    QMessageBox,
 )
 
 from pynput import keyboard as _kb
@@ -22,6 +24,7 @@ from gui.widgets.macro_panel import MacroPanel
 from gui.widgets.options_panel import OptionsPanel
 from engine.player import MacroPlayer
 from engine.recorder import MacroRecorder
+from engine.macro_file import save_macro, load_macro, MACRO_EXTENSION, MACRO_FILE_FILTER
 
 # Need this so when the player thread is finished, it can signal the play button to uncheck
 class _PlayerBridge(QObject):
@@ -127,6 +130,8 @@ class MainWindow(QMainWindow):
         self.editor_panel.setVisible(False)
 
     def _connect_signals(self):
+        self.open_action.triggered.connect(self.on_open)
+        self.save_action.triggered.connect(self.on_save)
         self.editor_action.toggled.connect(self.on_editor_toggled)
         self.play_action.toggled.connect(self.on_play_toggled)
         self._player_bridge.finished.connect(self._on_playback_complete)
@@ -140,9 +145,44 @@ class MainWindow(QMainWindow):
         self._recorder_bridge.hotkey_triggered.connect(self._on_record_hotkey)
         self._player_bridge.hotkey_triggered.connect(self._on_play_hotkey)
     
-    def open_btn_clicked(self, s):
-        print("Open Button Clicked")
-    
+    def on_save(self):
+        actions = self.macro_panel.get_actions()
+        if not actions:
+            QMessageBox.information(
+                self, "Save Macro",
+                "There's nothing to save yet -- record or build a macro first.",
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Macro", "", MACRO_FILE_FILTER,
+        )
+        if not path:
+            return
+        # getSaveFileName only guarantees the extension when the user leaves
+        # the filter's default in place; if they typed a bare name, add ours.
+        if not path.lower().endswith(MACRO_EXTENSION):
+            path += MACRO_EXTENSION
+        try:
+            save_macro(path, actions)
+        except OSError as e:
+            QMessageBox.critical(self, "Save Macro", f"Couldn't save the macro:\n{e}")
+
+    def on_open(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Macro", "", MACRO_FILE_FILTER,
+        )
+        if not path:
+            return
+        try:
+            actions = load_macro(path)
+        except (OSError, ValueError, TypeError) as e:
+            # ValueError covers a malformed file (json.JSONDecodeError and our
+            # own format checks); TypeError covers an action entry whose keys
+            # don't fit its constructor.
+            QMessageBox.critical(self, "Open Macro", f"Couldn't open the macro:\n{e}")
+            return
+        self.macro_panel.load_actions(actions)
+
     def on_editor_toggled(self, checked: bool):
         if checked:
             self.editor_panel.setVisible(True)
@@ -182,7 +222,7 @@ class MainWindow(QMainWindow):
         self.play_action.setChecked(not self.play_action.isChecked())
 
     def _start_global_hotkeys(self):
-        settings = QSettings("tinytask", "tinytask")
+        settings = QSettings("Macro", "Macro")
         record_key = str(settings.value("hotkeys/record", "<f9>"))
         play_key = str(settings.value("hotkeys/playback", "<f10>"))
 

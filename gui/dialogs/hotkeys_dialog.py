@@ -94,7 +94,7 @@ class HotkeysDialog(QDialog):
         self.setMinimumWidth(320)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        self._settings = QSettings("tinytask", "tinytask")
+        self._settings = QSettings("Macro", "Macro")
         self._record_key = self._settings.value("hotkeys/record", "<f9>")
         self._play_key = self._settings.value("hotkeys/playback", "<f10>")
         self._capturing = None  # "record" | "play" | None

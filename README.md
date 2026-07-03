@@ -6,7 +6,7 @@ Click Play to play your macro.
 
 Currently there is no further functionality.
 
-Main goal is to allow the user to record whatever they want, like tinytask, but with the ability to further edit these macros in the editor. Along with the ability to build macros from scratch.
+Main goal is to allow the user to record whatever they want, like a classic macro/keystroke recorder, but with the ability to further edit these macros in the editor. Along with the ability to build macros from scratch.
 
 plans:  
 &emsp;add macro recording  

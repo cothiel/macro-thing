@@ -17,7 +17,7 @@ class PreferencesDialog(QDialog):
         self.setWindowTitle("Preferences")
         self.setMinimumWidth(300)
 
-        self._settings = QSettings("tinytask", "tinytask")
+        self._settings = QSettings("Macro", "Macro")
 
         layout = QVBoxLayout(self)
 
@@ -88,16 +88,16 @@ class PreferencesDialog(QDialog):
 
     @staticmethod
     def repeat_count() -> int:
-        return QSettings("tinytask", "tinytask").value("playback/repeat_count", 1, type=int)
+        return QSettings("Macro", "Macro").value("playback/repeat_count", 1, type=int)
 
     @staticmethod
     def continuous_playback_enabled() -> bool:
-        return QSettings("tinytask", "tinytask").value("playback/continuous", False, type=bool)
+        return QSettings("Macro", "Macro").value("playback/continuous", False, type=bool)
 
     @staticmethod
     def default_wait_seconds() -> float:
-        return QSettings("tinytask", "tinytask").value("editor/default_wait_seconds", 1.0, type=float)
+        return QSettings("Macro", "Macro").value("editor/default_wait_seconds", 1.0, type=float)
 
     @staticmethod
     def move_merge_wait_threshold() -> float:
-        return QSettings("tinytask", "tinytask").value("editor/move_merge_wait_threshold", 0.3, type=float)
+        return QSettings("Macro", "Macro").value("editor/move_merge_wait_threshold", 0.3, type=float)
