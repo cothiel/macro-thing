@@ -21,19 +21,6 @@ class PreferencesDialog(QDialog):
 
         layout = QVBoxLayout(self)
 
-        recording_group = QGroupBox("Recording")
-        group_layout = QVBoxLayout(recording_group)
-
-        self.precision_recorder_cb = QCheckBox("Precision recorder")
-        self.precision_recorder_cb.setToolTip(
-            "Translate every recorded pynput action into a pyautogui-compatible action."
-        )
-        self.precision_recorder_cb.setChecked(
-            self._settings.value("recording/precision_recorder", False, type=bool)
-        )
-        group_layout.addWidget(self.precision_recorder_cb)
-        layout.addWidget(recording_group)
-
         playback_group = QGroupBox("Playback")
         playback_layout = QFormLayout(playback_group)
 
@@ -93,16 +80,11 @@ class PreferencesDialog(QDialog):
         layout.addWidget(buttons)
 
     def _save_and_accept(self):
-        self._settings.setValue("recording/precision_recorder", self.precision_recorder_cb.isChecked())
         self._settings.setValue("playback/repeat_count", self.repeat_count_spin.value())
         self._settings.setValue("playback/continuous", self.continuous_cb.isChecked())
         self._settings.setValue("editor/default_wait_seconds", self.default_wait_spin.value())
         self._settings.setValue("editor/move_merge_wait_threshold", self.merge_wait_spin.value())
         self.accept()
-
-    @staticmethod
-    def precision_recorder_enabled() -> bool:
-        return QSettings("tinytask", "tinytask").value("recording/precision_recorder", False, type=bool)
 
     @staticmethod
     def repeat_count() -> int:

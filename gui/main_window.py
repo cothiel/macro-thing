@@ -171,10 +171,9 @@ class MainWindow(QMainWindow):
             self._recorder.start()
         else:
             self._recorder.stop()
-            if PreferencesDialog.precision_recorder_enabled():
-                events = self._recorder.get_events()
-                actions = translate_precision(events)
-                self.macro_panel.load_actions(actions)
+            events = self._recorder.get_events()
+            actions = translate_precision(events)
+            self.macro_panel.load_actions(actions)
 
     def _on_record_hotkey(self):
         self.record_action.setChecked(not self.record_action.isChecked())
