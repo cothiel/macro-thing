@@ -92,6 +92,7 @@ class HotkeysDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Hotkeys")
         self.setMinimumWidth(320)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._settings = QSettings("tinytask", "tinytask")
         self._record_key = self._settings.value("hotkeys/record", "<f9>")
@@ -132,11 +133,16 @@ class HotkeysDialog(QDialog):
         self._capturing = "record"
         self._record_btn.setText("Press a key...")
         self._play_btn.setChecked(False)
+        # The button keeps keyboard focus after being clicked, so without
+        # this, keyPressEvent below never actually fires on a real keypress
+        # -- only the focused widget receives key events.
+        self.setFocus()
 
     def _start_capture_play(self):
         self._capturing = "play"
         self._play_btn.setText("Press a key...")
         self._record_btn.setChecked(False)
+        self.setFocus()
 
     def keyPressEvent(self, event):
         if self._capturing is None:

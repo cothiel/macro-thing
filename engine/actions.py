@@ -400,18 +400,87 @@ class HoldKeyAction(BaseAction):
         }
 
 
+'''
+    Scrolls the mouse wheel at a specific pixel coordinate.
+
+    Amounts are measured in wheel "notches" -- the same unit pynput reports
+    when recording (it normalizes Windows' raw WM_MOUSEWHEEL delta by
+    dividing by WHEEL_DELTA=120 before it ever reaches the recorder), so a
+    recorded scroll's dy/dx already means "notches" here. pyautogui.scroll()
+    does not do that conversion itself -- it passes whatever value it's
+    given straight through to the OS as a raw wheel delta -- so this class
+    multiplies back up by WHEEL_DELTA before calling it.
+
+    Args:
+        x (int): Horizontal pixel coordinate
+        y (int): Vertical pixel coordinate
+        dy (int): Vertical notches. Positive scrolls up, negative down.
+        dx (int): Horizontal notches. Positive scrolls right, negative left. Defaults to 0
+        duration (float): Seconds to spread the scroll over. 0 scrolls
+            instantly in a single motion (the default -- matches a single
+            recorded wheel notch, which is already an instantaneous event).
+        speed (int): Notches sent per step while animating a duration > 0
+            scroll. Smaller feels smoother, larger feels choppier. Ignored
+            when duration is 0.
+
+    Usage:
+        action = ScrollAction(1000, 300, dy=-5)
+        action.execute()
+
+        action = ScrollAction(x=1000, y=300, dy=10, duration=1.0, speed=2)
+        action.execute()
+'''
 class ScrollAction(BaseAction):
-    def __init__(self, x, y, dy, dx=0):
+    _WHEEL_DELTA = 120  # notch -> raw OS wheel delta, per the Windows API / pynput's own convention
+
+    def __init__(self, x, y, dy, dx=0, duration=0.0, speed=1):
         self.x = x
         self.y = y
-        self.dy = dy   # positive = up, negative = down
-        self.dx = dx   # positive = right, negative = left
+        self.dy = dy
+        self.dx = dx
+        self.duration = duration
+        self.speed = max(1, speed)
 
     def execute(self, stop_event=None, pause_event=None):
-        if self.dy != 0:
-            pyautogui.scroll(self.dy, x=self.x, y=self.y)
-        if self.dx != 0:
-            pyautogui.hscroll(self.dx, x=self.x, y=self.y)
+        print(f"Scrolling ({self.dy}, {self.dx}) notches at ({self.x}, {self.y}) over {self.duration}s")
+        steps = self._steps()
+        delay = self.duration / len(steps) if self.duration > 0 and steps else 0.0
+        for step_dy, step_dx in steps:
+            if stop_event and stop_event.is_set():
+                return
+            if pause_event:
+                pause_event.wait()
+                if stop_event and stop_event.is_set():
+                    return
+            if step_dy:
+                pyautogui.scroll(step_dy * self._WHEEL_DELTA, x=self.x, y=self.y)
+            if step_dx:
+                pyautogui.hscroll(step_dx * self._WHEEL_DELTA, x=self.x, y=self.y)
+            if delay:
+                time.sleep(delay)
+
+    def _steps(self):
+        """Split (dy, dx) into a list of (step_dy, step_dx) chunks of at
+        most ~speed notches each, so a scroll with duration > 0 plays back
+        as a smooth series of pulses instead of one instantaneous jump.
+        Steps are computed via running rounding (not naive division) so
+        they always sum to exactly (dy, dx) with no drift. `speed` only
+        matters when duration > 0 -- an instant (duration == 0) scroll is
+        always a single motion regardless of speed."""
+        magnitude = max(abs(self.dy), abs(self.dx))
+        if magnitude == 0:
+            return []
+        if self.duration <= 0:
+            return [(self.dy, self.dx)]
+        count = max(1, -(-magnitude // self.speed))  # ceil(magnitude / speed)
+        steps = []
+        dy_done = dx_done = 0
+        for i in range(1, count + 1):
+            dy_target = round(self.dy * i / count)
+            dx_target = round(self.dx * i / count)
+            steps.append((dy_target - dy_done, dx_target - dx_done))
+            dy_done, dx_done = dy_target, dx_target
+        return steps
 
     def to_dict(self):
         return {
@@ -420,4 +489,6 @@ class ScrollAction(BaseAction):
             "y": self.y,
             "dy": self.dy,
             "dx": self.dx,
+            "duration": self.duration,
+            "speed": self.speed,
         }

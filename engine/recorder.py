@@ -75,7 +75,16 @@ class MacroRecorder:
 def _normalize_key(key):
     """Return a stable string name for a pynput key, suitable for pyautogui translation."""
     if hasattr(key, 'char') and key.char is not None:
-        return key.char          # printable character, e.g. 'a', '1', '!'
+        ch = key.char
+        # When Ctrl is held with a letter, pynput reports the control
+        # character (Ctrl+V -> '\x16', Ctrl+A -> '\x01'), not the letter, so
+        # a recorded hotkey like ctrl+v would otherwise store an unusable
+        # '\x16'. Map control chars 0x01-0x1A back to a-z. Dedicated keys
+        # like Tab/Enter/Backspace arrive via the `name` branch below, not
+        # here, so this only affects Ctrl+letter combos.
+        if len(ch) == 1 and 0x01 <= ord(ch) <= 0x1A:
+            return chr(ord(ch) + 0x60)
+        return ch                # printable character, e.g. 'a', '1', '!'
     if hasattr(key, 'name'):
         return key.name          # special key name, e.g. 'enter', 'shift', 'ctrl_l'
     return str(key)

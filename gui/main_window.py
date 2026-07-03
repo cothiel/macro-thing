@@ -136,6 +136,7 @@ class MainWindow(QMainWindow):
         self.options_panel.row_changed.connect(self.macro_panel.on_row_changed)
         self.options_panel.expand_requested.connect(self.macro_panel.expand_row)
         self.options_panel.path_redrawn.connect(self.macro_panel.redraw_group)
+        self.options_panel.capturing_changed.connect(self._on_options_capturing_changed)
         self._recorder_bridge.hotkey_triggered.connect(self._on_record_hotkey)
         self._player_bridge.hotkey_triggered.connect(self._on_play_hotkey)
     
@@ -201,6 +202,19 @@ class MainWindow(QMainWindow):
         dlg = HotkeysDialog(self)
         dlg.exec()
         self._start_global_hotkeys()
+
+    def _on_options_capturing_changed(self, capturing: bool):
+        # A PressKey/Hotkey options widget is grabbing raw keyboard input to
+        # record a key or combo. The global hotkey listener is a low-level,
+        # system-wide keyboard hook that runs the whole time this window is
+        # open, so without pausing it here, it could intercept the very
+        # keys being captured before Qt ever sees them -- same reason
+        # _open_hotkeys() already pauses it while the Hotkeys dialog is open.
+        if capturing:
+            self._global_hotkeys.stop()
+            self._global_hotkeys.join()
+        else:
+            self._start_global_hotkeys()
 
     def closeEvent(self, event):
         self._global_hotkeys.stop()

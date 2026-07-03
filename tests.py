@@ -9,10 +9,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine.actions import (
     ClickAction, RepeatClickAction, MoveCursorAction, ClickDragAction,
-    WaitAction, PressKeyAction, HotkeyAction, TypeTextAction, HoldKeyAction
+    WaitAction, PressKeyAction, HotkeyAction, TypeTextAction, HoldKeyAction,
+    ScrollAction,
 )
 from engine.player import MacroPlayer
 from engine.precision_translator import translate_precision, build_move_path
+from gui.widgets.macro_model import group_actions, ungroup_rows, MacroRow
 
 
 class _BlockingAction:
@@ -354,6 +356,61 @@ class TestHoldKeyAction(unittest.TestCase):
         )
 
 
+class TestScrollAction(unittest.TestCase):
+
+    @patch('pyautogui.hscroll')
+    @patch('pyautogui.scroll')
+    def test_instant_scroll_scales_notches_to_wheel_delta(self, mock_scroll, mock_hscroll):
+        # 1 notch must become 120 raw units -- pyautogui doesn't do this
+        # conversion itself, unlike pynput which already normalized it down
+        # to notches when recording.
+        ScrollAction(100, 200, dy=1).execute()
+        mock_scroll.assert_called_once_with(120, x=100, y=200)
+        mock_hscroll.assert_not_called()
+
+    @patch('pyautogui.hscroll')
+    @patch('pyautogui.scroll')
+    def test_instant_scroll_is_single_call_regardless_of_speed(self, mock_scroll, mock_hscroll):
+        ScrollAction(0, 0, dy=-4, dx=2, speed=1).execute()
+        mock_scroll.assert_called_once_with(-480, x=0, y=0)
+        mock_hscroll.assert_called_once_with(240, x=0, y=0)
+
+    @patch('time.sleep')
+    @patch('pyautogui.scroll')
+    def test_duration_splits_into_speed_sized_steps_summing_correctly(self, mock_scroll, mock_sleep):
+        ScrollAction(0, 0, dy=10, duration=1.0, speed=3).execute()
+        calls = [c.args[0] for c in mock_scroll.call_args_list]
+        self.assertEqual(len(calls), 4)  # ceil(10/3)
+        self.assertEqual(sum(calls), 10 * ScrollAction._WHEEL_DELTA)
+        mock_sleep.assert_called_with(0.25)
+
+    @patch('pyautogui.scroll')
+    def test_stop_event_halts_remaining_steps(self, mock_scroll):
+        stop = threading.Event()
+        calls = []
+
+        def side_effect(*a, **k):
+            calls.append(a)
+            if len(calls) == 2:
+                stop.set()
+
+        mock_scroll.side_effect = side_effect
+        ScrollAction(0, 0, dy=10, duration=1.0, speed=1).execute(stop_event=stop)
+        self.assertLess(mock_scroll.call_count, 10)
+
+    def test_to_dict(self):
+        self.assertEqual(
+            ScrollAction(100, 200, dy=5, dx=-2, duration=0.5, speed=2).to_dict(),
+            {"Type": "Scroll", "x": 100, "y": 200, "dy": 5, "dx": -2,
+             "duration": 0.5, "speed": 2}
+        )
+
+    def test_to_dict_defaults(self):
+        d = ScrollAction(0, 0, dy=1).to_dict()
+        self.assertEqual(d["duration"], 0.0)
+        self.assertEqual(d["speed"], 1)
+
+
 # ---------------------------------------------------------------------------
 # MacroPlayer
 # ---------------------------------------------------------------------------
@@ -591,6 +648,64 @@ class TestBuildMovePath(unittest.TestCase):
         self.assertIn('WaitAction', types)
         wait = next(a for a in actions if isinstance(a, WaitAction))
         self.assertAlmostEqual(wait.seconds, 0.28, places=3)
+
+
+class TestGroupActions(unittest.TestCase):
+    """group_actions()/MacroRow live in the GUI layer (gui/widgets/macro_model.py)
+    but are pure Python with no Qt dependency, so they're covered here like
+    any other engine-level logic."""
+
+    def test_move_run_collapses_into_one_group(self):
+        m = lambda x, y: MoveCursorAction(x, y)
+        actions = [ClickAction(0, 0), m(1, 1), m(2, 2), m(3, 3), ClickAction(9, 9)]
+        rows = group_actions(actions)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(rows[1].is_group())
+        self.assertIs(rows[1].group_kind(), MoveCursorAction)
+        self.assertEqual(ungroup_rows(rows), actions)
+
+    def test_scroll_run_collapses_into_one_group(self):
+        s = lambda: ScrollAction(5, 5, dy=1)
+        actions = [ClickAction(0, 0), s(), s(), s(), ClickAction(9, 9)]
+        rows = group_actions(actions)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(rows[1].is_group())
+        self.assertIs(rows[1].group_kind(), ScrollAction)
+        self.assertIn("Scroll (3)", rows[1].label())
+        self.assertEqual(ungroup_rows(rows), actions)
+
+    def test_move_and_scroll_runs_never_merge_with_each_other(self):
+        actions = [MoveCursorAction(1, 1), MoveCursorAction(2, 2), ScrollAction(0, 0, dy=1), ScrollAction(0, 0, dy=1)]
+        rows = group_actions(actions, merge_wait_threshold=1.0)
+        self.assertEqual(len(rows), 2)
+        self.assertIs(rows[0].group_kind(), MoveCursorAction)
+        self.assertIs(rows[1].group_kind(), ScrollAction)
+
+    def test_merge_threshold_folds_short_wait_scroll_bursts(self):
+        s = lambda: ScrollAction(5, 5, dy=1)
+        actions = [s(), s(), WaitAction(0.02), s(), WaitAction(0.02), s(), WaitAction(2.0), s(), s()]
+        rows = group_actions(actions, merge_wait_threshold=0.3)
+        self.assertEqual(len(rows), 3)  # merged burst, long wait, final burst
+        self.assertEqual(rows[0].label(), "Scroll (4, 2 pauses) dy=+4")
+        self.assertEqual(rows[1].actions[0].seconds, 2.0)
+        self.assertEqual(rows[2].label(), "Scroll (2) dy=+2")
+        self.assertEqual(ungroup_rows(rows), actions)
+
+    def test_merge_threshold_zero_never_merges(self):
+        s = lambda: ScrollAction(5, 5, dy=1)
+        actions = [s(), WaitAction(0.01), s()]
+        rows = group_actions(actions, merge_wait_threshold=0.0)
+        self.assertEqual(len(rows), 3)
+
+    def test_group_kind_none_for_non_group_row(self):
+        row = MacroRow([ClickAction(0, 0)])
+        self.assertFalse(row.is_group())
+        self.assertIsNone(row.group_kind())
+
+    def test_scroll_label_includes_horizontal_when_nonzero(self):
+        row = MacroRow([ScrollAction(0, 0, dy=3, dx=2), ScrollAction(0, 0, dy=3, dx=2)])
+        self.assertIn("dy=+6", row.label())
+        self.assertIn("dx=+4", row.label())
 
 
 if __name__ == '__main__':

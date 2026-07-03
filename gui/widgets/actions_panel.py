@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from engine.actions import (
     ClickAction, RepeatClickAction, MoveCursorAction, ClickDragAction,
     WaitAction, PressKeyAction, HotkeyAction, TypeTextAction, HoldKeyAction,
+    ScrollAction,
 )
 from gui.widgets.macro_item import MacroItem, get_dragged_item
 
@@ -20,6 +21,7 @@ _TEMPLATES = [
     RepeatClickAction(0, 0, 1),
     MoveCursorAction(0, 0),
     ClickDragAction(0, 0),
+    ScrollAction(0, 0, dy=1),
     WaitAction(1),
     PressKeyAction('a'),
     HotkeyAction(['ctrl', 'c']),

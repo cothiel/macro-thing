@@ -5,10 +5,10 @@ from PySide6.QtWidgets import (
     QFormLayout, QSpinBox, QDoubleSpinBox, QLineEdit, QComboBox, QCheckBox,
     QPushButton, QApplication,
 )
-from PySide6.QtCore import Qt, Signal, QPoint, QTimer
+from PySide6.QtCore import Qt, Signal, QPoint, QTimer, QEvent
 from PySide6.QtGui import QPainter, QPen, QColor, QPolygon
 
-from engine.actions import MoveCursorAction
+from engine.actions import MoveCursorAction, ScrollAction
 from engine.precision_translator import build_move_path
 
 
@@ -54,9 +54,135 @@ def _qt_key_to_pyautogui(key: Qt.Key, text: str) -> str:
     """Returns a pyautogui key name for the given Qt key, or '' if unsupported."""
     if key in _QT_KEY_TO_PYAUTOGUI:
         return _QT_KEY_TO_PYAUTOGUI[key]
+    # Derive letters/digits from the key CODE, not text: when a modifier like
+    # Ctrl is held, event.text() is the control character (e.g. '\x03' for
+    # Ctrl+C), not 'c', so the text path below fails for exactly the combos
+    # people care about. This mirrors how HotkeysDialog maps keys.
+    if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+        return chr(key).lower()
+    if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+        return chr(key)
     if text and text.isprintable() and len(text) == 1:
         return text.lower()
     return ''
+
+
+_STANDALONE_MODIFIERS = (
+    Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+    Qt.Key.Key_Meta, Qt.Key.Key_AltGr,
+)
+
+
+def _qt_combo_to_pyautogui_keys(event) -> list:
+    """Capture a full hotkey combo (held modifiers + the key that completes
+    it) from a single Qt key-press event, the same way HotkeysDialog
+    captures a global hotkey -- Qt already reports currently-held
+    modifiers via event.modifiers() on the event for the final key, so a
+    chord like Ctrl+Shift+C arrives as one event for 'C' with both
+    modifiers set, no separate press-then-press-then-press tracking needed.
+    Returns a pyautogui-compatible key list (e.g. ['ctrl', 'shift', 'c']),
+    or None while only a standalone modifier has been pressed so far (still
+    waiting for the real key) or for an unsupported key.
+    """
+    if event.key() in _STANDALONE_MODIFIERS:
+        return None
+
+    keys = []
+    mods = event.modifiers()
+    if mods & Qt.KeyboardModifier.ControlModifier:
+        keys.append('ctrl')
+    if mods & Qt.KeyboardModifier.AltModifier:
+        keys.append('alt')
+    if mods & Qt.KeyboardModifier.ShiftModifier:
+        keys.append('shift')
+    if mods & Qt.KeyboardModifier.MetaModifier:
+        keys.append('win')
+
+    main_key = _qt_key_to_pyautogui(event.key(), event.text())
+    if not main_key or main_key in keys:
+        return None
+    keys.append(main_key)
+    return keys
+
+
+class _KeyCaptureButton(QPushButton):
+    """Inline key/hotkey recorder: click it and its label becomes 'Press a
+    key...', then the next key (or modifier+key combo) you press is
+    captured -- the same visible flow as the Settings -> Hotkeys buttons,
+    with no popup.
+
+    Capture is done with an application-level event filter rather than the
+    widget's own keyPressEvent. The options panel this lives in is a docked
+    child widget, not a top-level window, so it can't reliably hold the
+    keyboard focus that keyPressEvent depends on (that's why the earlier
+    focus-based attempts failed). An app-level filter intercepts the
+    keypress regardless of which widget currently has focus."""
+    captured = Signal(list)           # pyautogui key list, e.g. ['ctrl', 'c']
+    capturing_changed = Signal(bool)  # so the app can pause its global hotkey listener meanwhile
+
+    def __init__(self, combo: bool, idle_text: str, parent=None):
+        super().__init__(parent)
+        self._combo = combo
+        self._idle_text = idle_text
+        self._capturing = False
+        self.clicked.connect(self._begin_capture)
+
+    def set_idle_text(self, text: str):
+        self._idle_text = text
+        if not self._capturing:
+            self.setText(text)
+
+    def _begin_capture(self):
+        if self._capturing:
+            return
+        self._capturing = True
+        self.setText("Press a key combo..." if self._combo else "Press a key...")
+        self.capturing_changed.emit(True)
+        QApplication.instance().installEventFilter(self)
+
+    def _end_capture(self):
+        if not self._capturing:
+            return
+        self._capturing = False
+        QApplication.instance().removeEventFilter(self)
+        self.setText(self._idle_text)
+        self.capturing_changed.emit(False)
+
+    def eventFilter(self, obj, event):
+        if not self._capturing:
+            return super().eventFilter(obj, event)
+        etype = event.type()
+        if etype == QEvent.Type.ShortcutOverride:
+            # Before delivering a modifier+key combo as a normal KeyPress, Qt
+            # first sends a ShortcutOverride. If that combo collides with any
+            # shortcut in the app, the KeyPress is consumed as a shortcut and
+            # never reaches this filter -- which is why some combos (e.g.
+            # ctrl+shift+home) were silently failing while others worked.
+            # Accepting it forces Qt to deliver a plain KeyPress instead.
+            event.accept()
+            return True
+        if etype == QEvent.Type.KeyRelease:
+            return True  # swallow releases so they don't leak into the app
+        if etype != QEvent.Type.KeyPress:
+            return super().eventFilter(obj, event)
+
+        key = event.key()
+        if key == Qt.Key.Key_Escape:
+            self._end_capture()
+            return True
+
+        if self._combo:
+            result = _qt_combo_to_pyautogui_keys(event)
+        elif key in _STANDALONE_MODIFIERS:
+            result = None  # a lone modifier isn't a complete key; keep waiting
+        else:
+            single = _qt_key_to_pyautogui(key, event.text())
+            result = [single] if single else None
+
+        if result:
+            self._end_capture()
+            self.captured.emit(result)
+        return True  # swallow every keypress while capturing
 
 
 # --- helpers ---
@@ -64,6 +190,7 @@ def _qt_key_to_pyautogui(key: Qt.Key, text: str) -> str:
 def _coord_spin() -> QSpinBox:
     s = QSpinBox()
     s.setRange(0, 7680)
+    s.setToolTip("Absolute screen pixel coordinate (0, 0 is the top-left corner).")
     return s
 
 def _dur_spin(min_val: float = 0.0, max_val: float = 3600.0) -> QDoubleSpinBox:
@@ -76,6 +203,7 @@ def _dur_spin(min_val: float = 0.0, max_val: float = 3600.0) -> QDoubleSpinBox:
 def _button_combo() -> QComboBox:
     c = QComboBox()
     c.addItems(["left", "right", "middle"])
+    c.setToolTip("Mouse button to use.")
     return c
 
 
@@ -299,6 +427,13 @@ class _PathDrawOverlay(QWidget):
 
 class _BaseOptions(QWidget):
     changed = Signal()
+    # Emitted by widgets that need to capture raw keyboard input (PressKey,
+    # Hotkey) while the app's global hotkey listener -- a low-level,
+    # OS-wide keyboard hook that runs the entire time the main window is
+    # open -- could otherwise intercept the very keys being captured before
+    # Qt ever sees them. MainWindow pauses that listener while this is True,
+    # the same way it already does for the Hotkeys settings dialog.
+    capturing_changed = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -320,6 +455,12 @@ class _BaseOptions(QWidget):
         self._picker = _ScreenPicker()
         self._picker.picked.connect(lambda x, y: on_picked(x, y))
 
+    def _pick_position_button(self, label, on_picked) -> QPushButton:
+        btn = QPushButton(label)
+        btn.setToolTip("Click, then click anywhere on screen to capture that position.")
+        btn.clicked.connect(lambda: self._start_pick(on_picked))
+        return btn
+
     def _populate(self, action): raise NotImplementedError(action)
     def _apply(self, action): raise NotImplementedError(action)
 
@@ -334,10 +475,9 @@ class _ClickOptions(_BaseOptions):
         self._x = _coord_spin()
         self._y = _coord_spin()
         self._btn = _button_combo()
-        pick_btn = QPushButton("Pick position")
-        pick_btn.clicked.connect(lambda: self._start_pick(
+        pick_btn = self._pick_position_button("Pick position",
             lambda x, y: (self._x.setValue(x), self._y.setValue(y))
-        ))
+        )
         form.addRow("X:", self._x)
         form.addRow("Y:", self._y)
         form.addRow("", pick_btn)
@@ -366,12 +506,13 @@ class _RepeatClickOptions(_BaseOptions):
         self._y = _coord_spin()
         self._count = QSpinBox()
         self._count.setRange(1, 100000)
+        self._count.setToolTip("Number of times to click.")
         self._interval = _dur_spin(0.01, 60.0)
+        self._interval.setToolTip("Seconds to wait between each click.")
         self._btn = _button_combo()
-        pick_btn = QPushButton("Pick position")
-        pick_btn.clicked.connect(lambda: self._start_pick(
+        pick_btn = self._pick_position_button("Pick position",
             lambda x, y: (self._x.setValue(x), self._y.setValue(y))
-        ))
+        )
         form.addRow("X:", self._x)
         form.addRow("Y:", self._y)
         form.addRow("", pick_btn)
@@ -405,19 +546,26 @@ class _MoveCursorOptions(_BaseOptions):
         self._end_x = _coord_spin()
         self._end_y = _coord_spin()
         self._dur = _dur_spin(0.0, 60.0)
+        self._dur.setToolTip(
+            "Time to glide from the current position to the end position. "
+            "0 jumps instantly; very short values still play back precisely, "
+            "not just as a jump."
+        )
         self._use_start = QCheckBox("Custom start position")
+        self._use_start.setToolTip(
+            "If enabled, the cursor jumps instantly to Start X/Y before gliding "
+            "to the end position, instead of gliding from wherever it already is."
+        )
         self._start_x = _coord_spin()
         self._start_x.setEnabled(False)
         self._start_y = _coord_spin()
         self._start_y.setEnabled(False)
-        pick_end_btn = QPushButton("Pick end position")
-        pick_end_btn.clicked.connect(lambda: self._start_pick(
+        pick_end_btn = self._pick_position_button("Pick end position",
             lambda x, y: (self._end_x.setValue(x), self._end_y.setValue(y))
-        ))
-        pick_start_btn = QPushButton("Pick start position")
-        pick_start_btn.clicked.connect(lambda: self._start_pick(
+        )
+        pick_start_btn = self._pick_position_button("Pick start position",
             lambda x, y: (self._start_x.setValue(x), self._start_y.setValue(y))
-        ))
+        )
         form.addRow("End X:", self._end_x)
         form.addRow("End Y:", self._end_y)
         form.addRow("", pick_end_btn)
@@ -464,20 +612,24 @@ class _ClickDragOptions(_BaseOptions):
         self._end_x = _coord_spin()
         self._end_y = _coord_spin()
         self._dur = _dur_spin(0.0, 60.0)
+        self._dur.setToolTip("Time to drag from the start position to the end position.")
         self._btn = _button_combo()
+        self._btn.setToolTip("Mouse button held down for the duration of the drag.")
         self._use_start = QCheckBox("Custom start position")
+        self._use_start.setToolTip(
+            "If enabled, the cursor jumps instantly to Start X/Y before the drag "
+            "begins, instead of starting from wherever it already is."
+        )
         self._start_x = _coord_spin()
         self._start_x.setEnabled(False)
         self._start_y = _coord_spin()
         self._start_y.setEnabled(False)
-        pick_end_btn = QPushButton("Pick end position")
-        pick_end_btn.clicked.connect(lambda: self._start_pick(
+        pick_end_btn = self._pick_position_button("Pick end position",
             lambda x, y: (self._end_x.setValue(x), self._end_y.setValue(y))
-        ))
-        pick_start_btn = QPushButton("Pick start position")
-        pick_start_btn.clicked.connect(lambda: self._start_pick(
+        )
+        pick_start_btn = self._pick_position_button("Pick start position",
             lambda x, y: (self._start_x.setValue(x), self._start_y.setValue(y))
-        ))
+        )
         form.addRow("End X:", self._end_x)
         form.addRow("End Y:", self._end_y)
         form.addRow("", pick_end_btn)
@@ -527,6 +679,7 @@ class _WaitOptions(_BaseOptions):
         form.setContentsMargins(8, 8, 8, 8)
         self._seconds = _dur_spin(0.01, 3600.0)
         self._seconds.setSingleStep(0.5)
+        self._seconds.setToolTip("How long to pause before the next action runs.")
         form.addRow("Seconds:", self._seconds)
         self._seconds.valueChanged.connect(self._emit)
 
@@ -542,45 +695,61 @@ class _PressKeyOptions(_BaseOptions):
         super().__init__(parent)
         form = QFormLayout(self)
         form.setContentsMargins(8, 8, 8, 8)
-        self._key = QPushButton("Click to select key")
-        self._key.setCheckable(True)
+        self._key = _KeyCaptureButton(combo=False, idle_text="Click to select key")
+        self._key.setToolTip("Click, then press the single key this action should send.")
+        self._key.captured.connect(self._on_captured)
+        self._key.capturing_changed.connect(self.capturing_changed)
         form.addRow("Key:", self._key)
-        self._key.toggled.connect(self._on_key_toggled)
 
     def _populate(self, action):
-        self._key.setText(action.key)
+        self._key.set_idle_text(action.key)
 
     def _apply(self, action):
         action.key = self._key.text()
 
-    def _on_key_toggled(self, checked):
-        if checked:
-            self._key.setText("Press a key")
-
-    def keyPressEvent(self, event):
-        if self._key.isChecked():
-            self._key.setText(_qt_key_to_pyautogui(event.key(), event.text()))
-            self._emit()
-            self._key.setChecked(False)
-    
-
+    def _on_captured(self, keys):
+        self._key.set_idle_text(keys[0])
+        self._emit()
 
 
 class _HotkeyOptions(_BaseOptions):
+    """Records a hotkey combo the same way Settings -> Hotkeys does: click,
+    then press the actual key combination (hold modifiers + the final key
+    together) instead of typing key names by hand."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         form = QFormLayout(self)
         form.setContentsMargins(8, 8, 8, 8)
-        self._keys = QLineEdit()
-        self._keys.setPlaceholderText("e.g. ctrl, c")
-        form.addRow("Keys:", self._keys)
-        self._keys.textChanged.connect(self._emit)
+        self._keys = []
+        self._keys_btn = _KeyCaptureButton(combo=True, idle_text="Click to record hotkey")
+        self._keys_btn.setToolTip(
+            "Click, then press the key combination you want -- hold any "
+            "modifiers and press the final key together, the same way as "
+            "recording a hotkey in Settings -> Hotkeys. Keys are pressed "
+            "down in the order shown, then released in reverse order."
+        )
+        self._keys_btn.captured.connect(self._on_captured)
+        self._keys_btn.capturing_changed.connect(self.capturing_changed)
+        form.addRow("Keys:", self._keys_btn)
 
     def _populate(self, action):
-        self._keys.setText(", ".join(action.keys))
+        self._keys = list(action.keys)
+        self._update_label()
 
     def _apply(self, action):
-        action.keys = [k.strip() for k in self._keys.text().split(",") if k.strip()]
+        action.keys = list(self._keys)
+
+    def _update_label(self):
+        if self._keys:
+            self._keys_btn.set_idle_text(" + ".join(k.capitalize() for k in self._keys))
+        else:
+            self._keys_btn.set_idle_text("Click to record hotkey")
+
+    def _on_captured(self, keys):
+        self._keys = keys
+        self._update_label()
+        self._emit()
 
 
 class _TypeTextOptions(_BaseOptions):
@@ -589,8 +758,10 @@ class _TypeTextOptions(_BaseOptions):
         form = QFormLayout(self)
         form.setContentsMargins(8, 8, 8, 8)
         self._text = QLineEdit()
+        self._text.setToolTip("Text to type, one character at a time. Limited to printable ASCII characters.")
         self._interval = _dur_spin(0.01, 1.0)
         self._interval.setSingleStep(0.05)
+        self._interval.setToolTip("Seconds between each keystroke.")
         form.addRow("Text:", self._text)
         form.addRow("Interval (s):", self._interval)
         self._text.textChanged.connect(self._emit)
@@ -628,6 +799,10 @@ class _MoveGroupOptions(_BaseOptions):
         draw_btn.setToolTip("Click and hold on-screen to trace a new path; release to finish.")
         draw_btn.clicked.connect(self._start_draw)
         expand_btn = QPushButton("Expand into individual moves")
+        expand_btn.setToolTip(
+            "Splits this row back into one row per move sample, so you can "
+            "edit or delete a single point without affecting the rest."
+        )
         expand_btn.clicked.connect(lambda: self.expand_clicked.emit(self._action))
         form.addRow(self._summary)
         form.addRow(preview_btn)
@@ -673,6 +848,50 @@ class _MoveGroupOptions(_BaseOptions):
         self.path_redrawn.emit(self._action, new_actions)
 
 
+class _ScrollGroupOptions(_BaseOptions):
+    """Shown when a collapsed scroll-group MacroRow is selected. Read-only
+    summary plus 'Expand' -- unlike a move group, a scroll burst has no
+    spatial path worth drawing or previewing, just a magnitude and pace."""
+    expand_clicked = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        self._summary = QLabel()
+        self._summary.setWordWrap(True)
+        expand_btn = QPushButton("Expand into individual scrolls")
+        expand_btn.setToolTip(
+            "Splits this row back into one row per scroll notch, so you can "
+            "edit or delete a single one without affecting the rest."
+        )
+        expand_btn.clicked.connect(lambda: self.expand_clicked.emit(self._action))
+        form.addRow(self._summary)
+        form.addRow(expand_btn)
+
+    def _populate(self, row):
+        scrolls = [a for a in row.actions if isinstance(a, ScrollAction)]
+        pause_count = len(row.actions) - len(scrolls)
+        total_dy = sum(a.dy for a in scrolls)
+        total_dx = sum(a.dx for a in scrolls)
+        total_duration = sum(
+            a.duration if isinstance(a, ScrollAction) else a.seconds
+            for a in row.actions
+        )
+        pause_note = f"\nIncludes {pause_count} short pause{'s' if pause_count != 1 else ''}" if pause_count else ""
+        amount_line = f"Vertical: {total_dy:+d} notches"
+        if total_dx:
+            amount_line += f", Horizontal: {total_dx:+d} notches"
+        self._summary.setText(
+            f"{len(scrolls)} scroll notches{pause_note}\n"
+            f"{amount_line}\n"
+            f"Total duration: {total_duration:.2f}s"
+        )
+
+    def _apply(self, row):
+        pass  # no editable fields here; the Expand button bypasses _emit entirely
+
+
 class _HoldKeyOptions(_BaseOptions):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -680,7 +899,13 @@ class _HoldKeyOptions(_BaseOptions):
         form.setContentsMargins(8, 8, 8, 8)
         self._key = QLineEdit()
         self._key.setPlaceholderText("e.g. shift, w, space")
+        self._key.setToolTip("Key name to hold down.")
         self._dur = _dur_spin(0.1, 3600.0)
+        self._dur.setToolTip(
+            "How long to hold the key down. Pausing playback won't release it "
+            "early -- that would leave it stuck down until resumed, which "
+            "would fire repeated keypresses in whatever's focused."
+        )
         form.addRow("Key:", self._key)
         form.addRow("Duration (s):", self._dur)
         self._key.textChanged.connect(self._emit)
@@ -695,12 +920,75 @@ class _HoldKeyOptions(_BaseOptions):
         action.duration = self._dur.value()
 
 
+class _ScrollOptions(_BaseOptions):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        self._x = _coord_spin()
+        self._y = _coord_spin()
+        pick_btn = QPushButton("Pick position")
+        pick_btn.clicked.connect(lambda: self._start_pick(
+            lambda x, y: (self._x.setValue(x), self._y.setValue(y))
+        ))
+        self._dy = QSpinBox()
+        self._dy.setRange(-100000, 100000)
+        self._dy.setToolTip(
+            "Vertical amount, in mouse-wheel notches (1 notch = 1 physical "
+            "wheel click). Positive scrolls up, negative scrolls down."
+        )
+        self._dx = QSpinBox()
+        self._dx.setRange(-100000, 100000)
+        self._dx.setToolTip(
+            "Horizontal amount, in mouse-wheel notches. Positive scrolls "
+            "right, negative scrolls left."
+        )
+        self._duration = _dur_spin(0.0, 60.0)
+        self._duration.setToolTip(
+            "Time to spread the scroll over. 0 scrolls instantly in one motion."
+        )
+        self._speed = QSpinBox()
+        self._speed.setRange(1, 100000)
+        self._speed.setToolTip(
+            "Notches sent per step while animating (only matters when "
+            "duration > 0). Smaller feels smoother, larger feels choppier."
+        )
+
+        form.addRow("X:", self._x)
+        form.addRow("Y:", self._y)
+        form.addRow("", pick_btn)
+        form.addRow("Amount (vertical):", self._dy)
+        form.addRow("Amount (horizontal):", self._dx)
+        form.addRow("Duration (s):", self._duration)
+        form.addRow("Speed (notches/step):", self._speed)
+
+        for w in (self._x, self._y, self._dy, self._dx, self._duration, self._speed):
+            w.valueChanged.connect(self._emit)
+
+    def _populate(self, action):
+        self._x.setValue(action.x)
+        self._y.setValue(action.y)
+        self._dy.setValue(action.dy)
+        self._dx.setValue(action.dx)
+        self._duration.setValue(action.duration)
+        self._speed.setValue(action.speed)
+
+    def _apply(self, action):
+        action.x = self._x.value()
+        action.y = self._y.value()
+        action.dy = self._dy.value()
+        action.dx = self._dx.value()
+        action.duration = self._duration.value()
+        action.speed = self._speed.value()
+
+
 # --- panel ---
 
 class OptionsPanel(QWidget):
     row_changed = Signal(object)        # replaces direct macro_item.refresh()/mark_configured()
     expand_requested = Signal(object)   # user clicked "Expand" on a move-group row
     path_redrawn = Signal(object, list) # user drew a new path for a move-group row: (row, new_actions)
+    capturing_changed = Signal(bool)    # a child widget started/stopped grabbing raw keyboard input
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -720,6 +1008,7 @@ class OptionsPanel(QWidget):
         self._stack = QStackedWidget()
         self._blank = QWidget()
         self._move_group_widget = _MoveGroupOptions()
+        self._scroll_group_widget = _ScrollGroupOptions()
 
         self._widgets: dict[str, _BaseOptions] = {
             "Click":       _ClickOptions(),
@@ -731,15 +1020,19 @@ class OptionsPanel(QWidget):
             "Hotkey":      _HotkeyOptions(),
             "TypeText":    _TypeTextOptions(),
             "HoldKey":     _HoldKeyOptions(),
+            "Scroll":      _ScrollOptions(),
         }
 
         self._stack.addWidget(self._blank)
         self._stack.addWidget(self._move_group_widget)
         self._move_group_widget.expand_clicked.connect(self.expand_requested)
         self._move_group_widget.path_redrawn.connect(self.path_redrawn)
+        self._stack.addWidget(self._scroll_group_widget)
+        self._scroll_group_widget.expand_clicked.connect(self.expand_requested)
         for w in self._widgets.values():
             self._stack.addWidget(w)
             w.changed.connect(self._on_changed)
+            w.capturing_changed.connect(self.capturing_changed)
 
         outer_layout.addWidget(label)
         outer_layout.addWidget(line)
@@ -751,8 +1044,12 @@ class OptionsPanel(QWidget):
             self._stack.setCurrentWidget(self._blank)
             return
         if row.is_group():
-            self._move_group_widget.load(row)
-            self._stack.setCurrentWidget(self._move_group_widget)
+            if row.group_kind() is ScrollAction:
+                self._scroll_group_widget.load(row)
+                self._stack.setCurrentWidget(self._scroll_group_widget)
+            else:
+                self._move_group_widget.load(row)
+                self._stack.setCurrentWidget(self._move_group_widget)
             return
         action = row.actions[0]
         action_type = action.to_dict().get("Type", "")
